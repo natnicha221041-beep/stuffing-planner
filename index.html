@@ -320,7 +320,7 @@ a.btn.primary { color: #fff; }
           <span><b class="dot yellow"></b>ใกล้เต็ม ≥85%</span>
           <span><b class="dot red"></b>เกินพิกัด</span>
         </div>
-        <button class="btn ghost small" id="resetDemo" type="button">รีเซ็ตข้อมูลตัวอย่าง</button>
+        <button class="btn ghost small" id="resetDemo" type="button">โหลดข้อมูลตัวอย่างใหม่</button>
       </div>
     </aside>
     <main class="main">
@@ -424,7 +424,7 @@ document.addEventListener('click', (e) => {
 if (STATIC_MODE) document.body.classList.add('static-mode');
 document.getElementById('menuBtn').addEventListener('click', () => document.querySelector('.app').classList.toggle('nav-open'));
 document.getElementById('resetDemo').addEventListener('click', async () => {
-  if (!(await confirmDialog('รีเซ็ตข้อมูลตัวอย่าง', 'ข้อมูลทั้งหมดจะถูกแทนที่ด้วยข้อมูลตัวอย่างชุดเริ่มต้น ต้องการดำเนินการต่อหรือไม่?', { okLabel: 'รีเซ็ต', okCls: 'danger' }))) return;
+  if (!(await confirmDialog('โหลดข้อมูลตัวอย่างใหม่', 'ข้อมูลทั้งหมด (รวมข้อมูลจริงที่นำเข้า) จะถูกแทนที่ด้วยข้อมูลตัวอย่าง — ถ้าต้องการล้างเพื่อเริ่มใช้งานจริง ให้ใช้ปุ่ม "ล้างข้อมูลทั้งหมด" ในหน้า หน้างาน & นำเข้าไฟล์ ต้องการโหลดข้อมูลตัวอย่างหรือไม่?', { okLabel: 'โหลดข้อมูลตัวอย่าง', okCls: 'danger' }))) return;
   await api.post('/admin/reset-demo');
   await getMeta(true);
   await getKkMeta(true);
@@ -2860,6 +2860,19 @@ planningRouter.post('/admin/restore', (req, res) => {
     shipments: store.all('shipments').length,
     units: store.all('containerUnits').length,
   });
+});
+
+// ล้างข้อมูลทั้งหมด (เริ่มใช้งานจริง) — เก็บการตั้งค่าไว้: หน้างาน/ข้อจำกัด, Bag/Pallet master, ประเภทตู้
+planningRouter.post('/admin/clear-all', (req, res) => {
+  const KEEP = new Set(['sites', 'packMaterials', 'containerTypes']);
+  const removed = {};
+  store.transaction(() => {
+    for (const col of ['shipments', 'shipmentPlans', 'containerUnits', 'orders', 'containers', 'loadItems', 'actuals', 'products', 'capacityRules']) {
+      if (KEEP.has(col)) continue;
+      removed[col] = store.removeWhere(col, () => true);
+    }
+  });
+  res.json({ ok: true, removed });
 });
 
 planningRouter.post('/admin/reset-demo', (req, res) => {
@@ -6308,6 +6321,21 @@ async function backupCard(rerender) {
       h('div.toolbar',
         h('a.btn.primary', { href: `${apiBase}/admin/backup` }, '⬇ ดาวน์โหลดไฟล์สำรอง (.json)'),
         h('button.btn', { type: 'button', onclick: () => file.click() }, '⬆ กู้คืนจากไฟล์สำรอง'),
+        h('button.btn.danger', {
+          type: 'button',
+          onclick: async () => {
+            if (!(await confirmDialog('ล้างข้อมูลทั้งหมด',
+              'ลบ Shipment, แผนตู้, เบอร์ตู้/ซีล, คำสั่งซื้อ และสินค้า (SKU) ทั้งหมด รวมข้อมูลตัวอย่าง — การตั้งค่าหน้างาน (ตู้/วัน, เวลาโหลด), Bag/Pallet และประเภทตู้ยังอยู่ แนะนำให้ดาวน์โหลดไฟล์สำรองก่อน ต้องการล้างข้อมูลหรือไม่?',
+              { okLabel: 'ล้างข้อมูลทั้งหมด', okCls: 'danger' }))) return;
+            try {
+              await api.post('/admin/clear-all');
+              await getMeta(true);
+              await getKkMeta(true);
+              toast('ล้างข้อมูลแล้ว — เริ่มนำเข้า Export Plan หรือเพิ่ม Shipment ได้เลย', 'success', 6000);
+              rerender();
+            } catch (e) { toast(e.message, 'error', 6000); }
+          },
+        }, '🗑 ล้างข้อมูลทั้งหมด (เริ่มใช้งานจริง)'),
         file,
         h('span.muted', 'ไฟล์สำรองมีข้อมูลทั้งหมด (Shipment, แผน, เบอร์ตู้/ซีล) — ส่งให้เพื่อนร่วมงานกู้คืนเพื่อเห็นข้อมูลชุดเดียวกัน'))));
 }
