@@ -1,0 +1,17 @@
+{
+  "name": "stuffing-planner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Container Stuffing & Loading Planner — Frontend (Vanilla JS) + Backend (Node.js, zero dependencies)",
+  "scripts": {
+    "start": "node backend/src/server.js",
+    "dev": "node --watch backend/src/server.js",
+    "test": "cd backend && node --test test/*.test.js",
+    "seed": "node backend/src/db/reset.js",
+    "build:pages": "node scripts/build-pages.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "module"
+}
