@@ -3474,7 +3474,22 @@ kkRouter.patch('/packing-lines/:id', (req, res) => {
   if (!l) throw notFound('สายบรรจุ');
   const d = parseBody({ name: lineSchema.name, maxBagsPerDay: lineSchema.maxBagsPerDay, active: lineSchema.active }, req.body, { partial: true });
   if (req.body.products !== undefined) d.products = parseProducts(req.body.products);
-  res.json(store.transaction(() => store.update('packingLines', l.id, d)));
+  // เปลี่ยนรหัสสาย (เช่น KK-L1 → ไลน์ A) — ย้ายรายการบรรจุและ Shipment ที่ใช้รหัสเดิมตามไปด้วย
+  let newCode = req.body.code !== undefined ? String(req.body.code).trim() : null;
+  if (newCode !== null) {
+    if (!newCode) throw badRequest('รหัสสายห้ามว่าง');
+    if (newCode.length > 30) throw badRequest('รหัสสายยาวไม่เกิน 30 ตัวอักษร');
+    newCode = newCode.toUpperCase();
+    if (newCode !== l.code && store.findOne('packingLines', (x) => x.code === newCode)) throw conflict(`มีสาย ${newCode} อยู่แล้ว`);
+  }
+  res.json(store.transaction(() => {
+    if (newCode && newCode !== l.code) {
+      for (const r of store.find('packingRecords', (x) => x.lineCode === l.code)) store.update('packingRecords', r.id, { lineCode: newCode });
+      for (const sh of store.find('shipments', (x) => x.packLine === l.code)) store.update('shipments', sh.id, { packLine: newCode });
+      d.code = newCode;
+    }
+    return store.update('packingLines', l.id, d);
+  }));
 });
 kkRouter.delete('/packing-lines/:id', (req, res) => {
   const l = store.get('packingLines', req.params.id);
@@ -8492,7 +8507,7 @@ function linesCard(kkMeta, rerender) {
       },
       columns: [
         { key: 'siteCode', label: 'หน้างาน', render: (l) => h('b', l.siteCode) },
-        { key: 'code', label: 'สาย', render: (l) => h('span.mono', l.code) },
+        { key: 'code', label: 'รหัส / ชื่อย่อสาย', type: 'text', editable: true, width: '130px' },
         { key: 'name', label: 'ชื่อ', type: 'text', editable: true, width: '160px' },
         { key: 'maxBagsPerDay', label: 'ถุง/วัน สูงสุด', type: 'number', editable: true, num: true, step: 1, min: 0, width: '110px' },
         { key: 'products', label: 'เฉพาะสินค้า', type: 'text', editable: true, width: '180px' },
@@ -8960,11 +8975,12 @@ __define("js/views/kkpacking.js", function (__exports, __require, __url) {
 'use strict';
 Object.defineProperty(__exports, "downloadTemplate", { enumerable: true, get: () => downloadTemplate });
 Object.defineProperty(__exports, "render", { enumerable: true, get: () => render });
+Object.defineProperty(__exports, "openLineEdit", { enumerable: true, get: () => openLineEdit });
 Object.defineProperty(__exports, "openPackImport", { enumerable: true, get: () => openPackImport });
 Object.defineProperty(__exports, "clearPackPlan", { enumerable: true, get: () => clearPackPlan });
 Object.defineProperty(__exports, "openPackEdit", { enumerable: true, get: () => openPackEdit });
 // ตารางบรรจุถุงรายวัน — Shipment × วันที่ (ถุงตามแผน) + ความพร้อมก่อนโหลดตู้ + กำลังบรรจุของสาย
-const { api, apiBase, downloadApi } = __require("js/api.js");
+const { api, apiBase, downloadApi, getKkMeta } = __require("js/api.js");
 const { h, fmt, addDays, badge, renderIssues, modal, toast, field, withValidation, selectEl, confirmDialog, rangePicker, daysBetween } = __require("js/ui.js");
 const { siteSelect, currentSite, openShipmentModal } = __require("js/kkshared.js");
 const { kkState } = __require("js/kkshared.js");
@@ -9025,7 +9041,7 @@ async function render(root, { rerender, kkMeta }) {
       h('div.card-body', renderIssues(shown))));
   }
 
-  root.append(lineTable(g));
+  root.append(lineTable(g, site, rerender));
   root.append(mainTable(g, site, rerender));
 }
 
@@ -9036,17 +9052,103 @@ function kpi(label, value, sub, level) {
 const dayHead = (d, today) => h(`th.dcol${d.date === today ? '.today' : ''}${d.closed ? '.off' : ''}`,
   h('div', WD[new Date(`${d.date}T00:00:00`).getDay()]), h('div', fmt.date(d.date, { day: 'numeric', month: 'short' })));
 
-function lineTable(g) {
-  if (!g.lines.length) return h('div.issue.warning', h('span.ic', '▲'), 'หน้างานนี้ยังไม่มีสายบรรจุ — เพิ่มที่หน้า "หน้างาน & นำเข้าไฟล์"');
+function lineTable(g, site, rerender) {
+  const addBtn = h('button.btn.small', { type: 'button', onclick: () => openLineEdit(null, site, rerender) }, '+ เพิ่มสายบรรจุ');
+  if (!g.lines.length) return h('div.card', h('div.card-head', h('h2', 'สายบรรจุ'), addBtn), h('div.empty', 'หน้างานนี้ยังไม่มีสายบรรจุ'));
   return h('div.card',
-    h('div.card-head', h('h2', 'กำลังบรรจุของสาย (ถุง/วัน)'), h('span.hint', 'เขียว = ปกติ · เหลือง ≥85% · แดง = เกินกำลังบรรจุ')),
+    h('div.card-head', h('h2', 'กำลังบรรจุของสาย (ถุง/วัน)'), h('span.hint', 'กด ✎ เพื่อเปลี่ยนชื่อ/กำลังบรรจุ · คลิกช่องวันที่เพื่อย้ายงานไปสายอื่น · เขียว = ปกติ · เหลือง ≥85% · แดง = เกินกำลัง'), h('div.spacer'), addBtn),
     h('div.pgrid-wrap', { style: { maxHeight: 'none' } }, h('table.pgrid',
       h('thead', h('tr', h('th.sticky-col', 'สายบรรจุ'), h('th.num', 'กำลัง/วัน'), g.dates.map((d) => dayHead(d, g.today)))),
-      h('tbody', g.lines.map((l) => h('tr',
-        h('td.sticky-col', h('b', l.code), h('div.sub', l.name || '')),
-        h('td.num', fmt.num(l.maxBagsPerDay)),
-        l.days.map((d) => h(`td.cnt-cell.${d.level}${d.date === g.today ? '.today' : ''}`, { title: `${d.used}/${d.cap ?? '-'} ถุง` },
-          d.used ? h('b', fmt.num(d.used)) : '', d.over ? h('div.over', `+${d.over}`) : ''))))))));
+      h('tbody', g.lines.map((l) => {
+        const cap = h('input.pcell', { type: 'number', min: 0, step: 1, value: l.maxBagsPerDay ?? '', title: 'กำลังบรรจุ (ถุง/วัน) — แก้แล้วกด Enter' });
+        cap.addEventListener('change', async () => {
+          try { await api.patch(`/kk/packing-lines/${l.id}`, { maxBagsPerDay: cap.value === '' ? 0 : Number(cap.value) }); await getKkMeta(true); toast(`กำลังบรรจุ ${l.code} = ${cap.value || 0} ถุง/วัน`, 'success', 1500); rerender(); } catch (e) { toast(e.message, 'error'); }
+        });
+        return h('tr',
+          h('td.sticky-col', h('div.ship-head', h('b', l.code), h('span.row-acts', h('button.icon-btn', { type: 'button', title: 'แก้ไขสาย (ชื่อ / รหัส / กำลังบรรจุ)', onclick: () => openLineEdit(l, site, rerender) }, '✎'))), h('div.sub', l.name || '')),
+          h('td.num', { style: { minWidth: '90px' } }, cap),
+          l.days.map((d) => h(`td.cnt-cell.${d.level}${d.date === g.today ? '.today' : ''}`, {
+            title: `${d.used}/${d.cap ?? '-'} ถุง — คลิกเพื่อดู/ย้ายงาน`, style: { cursor: d.used ? 'pointer' : null },
+            onclick: () => { if (d.used) openLineDay(l, d.date, g.lines, site, rerender); },
+          }, d.used ? h('b', fmt.num(d.used)) : '', d.over ? h('div.over', `+${d.over}`) : '')));
+      })))));
+}
+
+// ---------- แก้ไข / เพิ่ม / ลบ สายบรรจุ ----------
+function openLineEdit(l, site, rerender) {
+  const isNew = !l;
+  const code = h('input.inp', { value: l?.code ?? `${site.code}-L`, placeholder: 'เช่น ไลน์ A หรือ KK-L3' });
+  const name = h('input.inp', { value: l?.name ?? '', placeholder: 'เช่น เครื่องบรรจุ Big bag หน้าโกดัง 1' });
+  const cap = h('input.inp', { type: 'number', min: 0, step: 1, value: l?.maxBagsPerDay ?? 300 });
+  const active = h('input', { type: 'checkbox', checked: l ? l.active !== false : true });
+  const actions = [{ label: 'ยกเลิก', onClick: (c) => c() }];
+  if (!isNew) {
+    actions.unshift({
+      label: 'ลบสายนี้', cls: 'danger',
+      onClick: async (close) => {
+        if (!(await confirmDialog('ลบสายบรรจุ', `ลบสาย ${l.code}? (ถ้ามีแผน/ยอดบรรจุอยู่ ระบบจะไม่ให้ลบ — ย้ายงานไปสายอื่น หรือปิดการใช้งานแทน)`, { okLabel: 'ลบ', okCls: 'danger' }))) return;
+        try { await api.del(`/kk/packing-lines/${l.id}`); await getKkMeta(true); close(); toast('ลบสายแล้ว', 'success'); rerender(); } catch (e) { toast(e.message, 'error', 6000); }
+      },
+    });
+  }
+  actions.push({
+    label: isNew ? 'เพิ่มสาย' : 'บันทึก', cls: 'primary',
+    onClick: async (close) => {
+      if (!code.value.trim()) return toast('กรอกรหัส/ชื่อย่อของสาย', 'warn');
+      const body = { code: code.value.trim(), name: name.value.trim(), maxBagsPerDay: Number(cap.value || 0), active: active.checked };
+      try {
+        if (isNew) await api.post('/kk/packing-lines', { ...body, siteCode: site.code });
+        else await api.patch(`/kk/packing-lines/${l.id}`, body);
+        await getKkMeta(true);
+        close();
+        toast(isNew ? `เพิ่มสาย ${body.code.toUpperCase()} แล้ว` : 'บันทึกสายบรรจุแล้ว', 'success');
+        rerender();
+      } catch (e) { toast(e.message, 'error', 6000); }
+    },
+  });
+  modal({
+    title: isNew ? `เพิ่มสายบรรจุ (${site.code})` : `แก้ไขสายบรรจุ ${l.code}`, narrow: true,
+    body: h('div', { style: { display: 'grid', gap: '10px' } },
+      field('รหัส / ชื่อย่อสาย (แสดงในตาราง)', code),
+      field('ชื่อเต็ม / รายละเอียด', name),
+      field('กำลังบรรจุ (ถุง/วัน)', cap),
+      h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, active, 'ใช้งานสายนี้'),
+      isNew ? null : h('div.sub', 'เปลี่ยนรหัสแล้ว แผน/ยอดบรรจุเดิมของสายนี้จะย้ายตามไปให้อัตโนมัติ')),
+    actions,
+  });
+}
+
+// ---------- งานบรรจุของสายในวันหนึ่ง: แก้จำนวน / ย้ายไปสายอื่น ----------
+async function openLineDay(l, date, lines, site, rerender) {
+  let dirty = false;
+  const body = h('div', { style: { display: 'grid', gap: '10px' } });
+  const draw = async () => {
+    const d = await api.get(`/kk/packing/daily?site=${encodeURIComponent(site.code)}&date=${date}`);
+    const rows = d.rows.filter((r) => r.lineCode === l.code && r.recordId);
+    body.replaceChildren(
+      h('div.stat-row', h('span', 'สาย ', h('b', l.code)), h('span', 'วันที่ ', h('b', fmt.dateLong(date))), h('span', 'รวม ', h('b', fmt.num(rows.reduce((a, r) => a + (r.plannedBags || 0), 0))), ` / ${fmt.num(l.maxBagsPerDay)} ถุง`)),
+      rows.length ? h('div.grid-wrap', h('table.grid',
+        h('thead', h('tr', ['Shipment', 'ถุงตามแผน', 'ถุงจริง', 'ย้ายไปสาย'].map((t) => h('th', t)))),
+        h('tbody', rows.map((r) => {
+          const p = h('input.cell', { type: 'number', min: 0, step: 1, value: r.plannedBags ?? 0, disabled: r.rolledOver });
+          p.onchange = async () => { if (await withValidation((force) => api.put('/kk/packing/records', { shipmentId: r.shipmentId, date, lineCode: l.code, plannedBags: Number(p.value || 0), force }))) { dirty = true; draw(); } };
+          const sel = selectEl(lines.map((x) => ({ value: x.code, label: x.code })), l.code);
+          sel.onchange = async () => {
+            if (sel.value === l.code) return;
+            const moved = await withValidation((force) => api.put('/kk/packing/records', {
+              shipmentId: r.shipmentId, date, lineCode: sel.value, plannedBags: r.plannedBags ?? 0, actualBags: r.actualBags ?? null, note: r.note || '', force,
+            }));
+            if (!moved) { sel.value = l.code; return; }
+            await api.del(`/kk/packing/records/${r.recordId}`);
+            dirty = true;
+            toast(`ย้าย ${r.code} ไปสาย ${sel.value} แล้ว`, 'success', 1800);
+            draw();
+          };
+          return h('tr', h('td.ro', h('b.mono', r.code), h('div.sub', r.product || '')), h('td', p), h('td.ro.num', r.actualBags ?? '–'), h('td', sel));
+        })))) : h('div.empty', 'ไม่มีงานบรรจุในสายนี้วันนี้แล้ว'));
+  };
+  await draw();
+  modal({ title: `งานบรรจุ ${l.code} · ${fmt.date(date)}`, body, actions: [{ label: 'ปิด', cls: 'primary', onClick: (c) => c() }], onClose: () => { if (dirty) rerender(); } });
 }
 
 function mainTable(g, site, rerender) {
