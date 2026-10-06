@@ -359,6 +359,13 @@ td.grid-actions { white-space: nowrap; }
 .big-bar span { position: relative; font-weight: 700; font-size: 12.5px; line-height: 24px; padding-left: 10px; }
 @media (max-width: 720px) { .prog-row { grid-template-columns: 1fr; } .prog-row .num { text-align: left; } }
 svg.chart .ax.past { opacity: .55; }
+table.pgrid td.pc.under { background: var(--yellow-bg); }
+table.pgrid td.pc.under .past { color: var(--yellow); font-weight: 600; }
+table.pgrid td.pc.nogo { background: #fff7ed; }
+table.pgrid td.pc.nogo .past { color: #c2410c; }
+table.pgrid td.pc.clickable { cursor: pointer; }
+table.pgrid td.pc.clickable:hover { outline: 2px solid var(--primary); outline-offset: -2px; }
+table.pgrid td.pc .past .sub { font-size: 10px; font-weight: 400; }
 
 </style>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='8' width='26' height='16' rx='2' fill='%231d4ed8'/><path d='M9 11v10M14 11v10M19 11v10M24 11v10' stroke='white' stroke-width='2'/></svg>" />
@@ -3205,7 +3212,17 @@ const shipmentSchema = {
   status: { type: 'enum', values: ['open', 'cancelled', 'closed'], default: 'open' },
   packLine: { type: 'string', max: 30 },
   packOpening: { type: 'int', min: 0, max: 100000 },
+  packingMtPerBag: { type: 'number', min: 0, max: 50 }, // น้ำหนักต่อถุง (ตัน/ถุง) ทศนิยม 2 ตำแหน่ง
 };
+/** น้ำหนักต่อถุงทศนิยม 2 ตำแหน่ง + ถ้าไม่ได้กรอกจำนวนถุง คำนวณจาก ตัน ÷ น้ำหนักต่อถุง */
+function applyBagWeight(data, prev = {}) {
+  if (data.packingMtPerBag != null) data.packingMtPerBag = Math.round(data.packingMtPerBag * 100) / 100 || null;
+  const w = data.packingMtPerBag !== undefined ? data.packingMtPerBag : prev.packingMtPerBag;
+  const mt = data.mt !== undefined ? data.mt : prev.mt;
+  const bags = data.bags !== undefined ? data.bags : prev.bags;
+  if (w > 0 && mt > 0 && !(bags > 0)) data.bags = Math.round(mt / w);
+  if (data.mt != null) data.mt = Math.round(data.mt * 100) / 100;
+}
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const checkTimes = (d) => {
   for (const k of ['closingTime', 'firstReturnTime']) if (d[k] && !TIME_RE.test(d[k])) throw badRequest(`${k} ต้องเป็น HH:MM`);
@@ -3321,6 +3338,7 @@ kkRouter.get('/shipments/:id', (req, res) => res.json(shipmentDetail(req.params.
 kkRouter.post('/shipments', (req, res) => {
   const data = parseBody(shipmentSchema, req.body);
   checkTimes(data);
+  applyBagWeight(data);
   if (!store.findOne('sites', (s) => s.code === data.siteCode)) throw notFound(`หน้างาน ${data.siteCode}`);
   if (store.findOne('shipments', (s) => s.siteCode === data.siteCode && s.code === data.code)) throw conflict(`Shipment ${data.code} มีอยู่แล้วในหน้างาน ${data.siteCode}`);
   data.containerType = normalizeContType(data.containerType);
@@ -3338,6 +3356,7 @@ kkRouter.patch('/shipments/:id', (req, res) => {
   if (!s) throw notFound('Shipment');
   const data = parseBody(shipmentSchema, req.body, { partial: true });
   checkTimes(data);
+  applyBagWeight(data, s);
   if (data.containerType) data.containerType = normalizeContType(data.containerType);
   if (data.conts !== undefined) {
     const locked = store.find('containerUnits', (u) => u.shipmentId === s.id && ['gate_in', 'loading', 'loaded'].includes(u.status)).length;
@@ -3347,7 +3366,7 @@ kkRouter.patch('/shipments/:id', (req, res) => {
     data.lines = [{ product: data.product ?? s.product, mt: data.mt ?? s.mt, bags: data.bags ?? s.bags, bagType: data.bagType ?? s.bagType, palletType: data.palletType ?? s.palletType }];
   }
   const days = store.find('shipmentPlans', (p) => p.shipmentId === s.id).map((p) => ({ siteCode: s.siteCode, date: p.date }));
-  const { issues } = kkGuarded(() => { store.update('shipments', s.id, data); syncUnits(s.id); if (data.packOpening !== undefined || data.bags !== undefined || data.product !== undefined || data.status !== undefined) rebalanceCarry(s.id); }, {
+  const { issues } = kkGuarded(() => { store.update('shipments', s.id, data); syncUnits(s.id); if (data.packOpening !== undefined || data.bags !== undefined || data.packingMtPerBag !== undefined || data.product !== undefined || data.status !== undefined) rebalanceCarry(s.id); }, {
     force: isForce(req), scope: { shipmentIds: [s.id], days },
   });
   res.json({ ...shipmentDetail(s.id), issues });
@@ -4324,6 +4343,7 @@ Object.defineProperty(__exports, "carryOut", { enumerable: true, get: () => carr
 Object.defineProperty(__exports, "openingOf", { enumerable: true, get: () => openingOf });
 Object.defineProperty(__exports, "rebalanceCarry", { enumerable: true, get: () => rebalanceCarry });
 Object.defineProperty(__exports, "transfersOf", { enumerable: true, get: () => transfersOf });
+Object.defineProperty(__exports, "lineUsageMt", { enumerable: true, get: () => lineUsageMt });
 Object.defineProperty(__exports, "lineUsage", { enumerable: true, get: () => lineUsage });
 Object.defineProperty(__exports, "lineLevel", { enumerable: true, get: () => lineLevel });
 Object.defineProperty(__exports, "readiness", { enumerable: true, get: () => readiness });
@@ -4376,7 +4396,7 @@ function lineOfShipment(s) {
 const needsPacking = (s) => s && s.status === 'open' && Number(s.bags) > 0 && Number(s.conts) > 0;
 const effBags = (r) => (r.actualBags ?? r.plannedBags ?? 0);
 /** ตันต่อถุงของ Shipment (MT รวม ÷ จำนวนถุง) */
-const mtPerBag = (s) => (s && s.bags > 0 && s.mt > 0 ? s.mt / s.bags : 0);
+const mtPerBag = (s) => (!s ? 0 : s.packingMtPerBag > 0 ? Number(s.packingMtPerBag) : s.bags > 0 && s.mt > 0 ? s.mt / s.bags : 0);
 const mtOf = (s, bags) => (bags == null ? null : round(bags * mtPerBag(s), 2));
 /** ตันของรายการบรรจุ (แผน / จริง) */
 function recMt(rec) {
@@ -4448,18 +4468,18 @@ function rebalanceCarry(shipmentId, depth = 0, moves = []) {
       const ex = store.findOne('packTransfers', (x) => x.fromId === s.id && x.toId === t.x.id);
       if (ex) store.update('packTransfers', ex.id, { bags: ex.bags + n, date: todayISO() });
       else store.insert('packTransfers', { fromId: s.id, toId: t.x.id, fromCode: s.code, toCode: t.x.code, product: s.product, bags: n, date: todayISO(), auto: true });
-      moves.push({ type: 'out', from: s.code, to: t.x.code, bags: n, product: s.product });
+      moves.push({ type: 'out', from: s.code, to: t.x.code, bags: n, mt: round(n * mtPerBag(s), 2), product: s.product });
       touched.add(t.x.id);
       delta -= n;
     }
-    if (delta > 0) moves.push({ type: 'nowhere', from: s.code, bags: delta, product: s.product });
+    if (delta > 0) moves.push({ type: 'nowhere', from: s.code, bags: delta, mt: round(delta * mtPerBag(s), 2), product: s.product });
   } else if (want < cur) {
     let back = cur - want;
     for (const t of store.find('packTransfers', (x) => x.fromId === s.id).sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id))) {
       if (back <= 0) break;
       const n = Math.min(back, t.bags);
       if (n === t.bags) store.remove('packTransfers', t.id); else store.update('packTransfers', t.id, { bags: t.bags - n });
-      moves.push({ type: 'back', from: t.toCode, to: s.code, bags: n, product: s.product });
+      moves.push({ type: 'back', from: t.toCode, to: s.code, bags: n, mt: round(n * mtPerBag(s), 2), product: s.product });
       touched.add(t.toId);
       back -= n;
     }
@@ -4469,11 +4489,17 @@ function rebalanceCarry(shipmentId, depth = 0, moves = []) {
 }
 function transfersOf(siteCode) {
   const ids = new Set(store.find('shipments', (x) => x.siteCode === siteCode).map((x) => x.id));
-  return store.find('packTransfers', (t) => ids.has(t.fromId) || ids.has(t.toId)).sort((a, b) => b.date.localeCompare(a.date));
+  return store.find('packTransfers', (t) => ids.has(t.fromId) || ids.has(t.toId)).sort((a, b) => b.date.localeCompare(a.date))
+    .map((t) => ({ ...t, mt: round(t.bags * mtPerBag(store.get('shipments', t.fromId)), 2) }));
 }
 const findRecord = (shipmentId, date, lineCode) =>
   store.findOne('packingRecords', (r) => r.shipmentId === shipmentId && r.date === date && r.lineCode === lineCode);
 
+/** ตันที่ใช้ของสายในวันหนึ่ง (จริง ถ้ามี / ไม่งั้นแผน) */
+function lineUsageMt(lineCode, date) {
+  return round(store.find('packingRecords', (r) => r.lineCode === lineCode && r.date === date)
+    .reduce((a, r) => a + effBags(r) * mtPerBag(store.get('shipments', r.shipmentId)), 0), 2);
+}
 function lineUsage(lineCode, date) {
   return store.find('packingRecords', (r) => r.lineCode === lineCode && r.date === date).reduce((a, r) => a + effBags(r), 0);
 }
@@ -4611,7 +4637,22 @@ const intOrNull = (v, name) => {
 };
 
 /** ตั้งค่าแผน/ยอดจริงของ Shipment ในวันหนึ่ง (บนสายของ Shipment หรือสายที่ระบุ) */
-function setPackingRecord({ shipmentId, date, lineCode, plannedBags, actualBags, note }, { force = false } = {}) {
+function setPackingRecord({ shipmentId, date, lineCode, plannedBags, actualBags, plannedMt, actualMt, note }, { force = false } = {}) {
+  // กรอกเป็นตันได้: แปลงเป็นจำนวนถุง = ตัน ÷ น้ำหนักต่อถุง (ปัดเป็นถุงเต็ม)
+  const sh0 = store.get('shipments', shipmentId);
+  const toBags = (mt, label) => {
+    if (mt === undefined) return undefined;
+    if (mt === null || mt === '') return null;
+    const w = mtPerBag(sh0);
+    if (!(w > 0)) throw badRequest(`Shipment ${sh0?.code ?? ''} ยังไม่มีน้ำหนักต่อถุง — กรอกน้ำหนักต่อถุง (ตัน/ถุง) ที่ข้อมูล Shipment ก่อน`);
+    const n = Number(mt);
+    if (!Number.isFinite(n) || n < 0) throw badRequest(`${label}ต้องเป็นตัวเลข ≥ 0`);
+    return Math.round(n / w);
+  };
+  if (sh0) {
+    if (plannedMt !== undefined) plannedBags = toBags(plannedMt, 'ตันตามแผน') ?? 0;
+    if (actualMt !== undefined) actualBags = toBags(actualMt, 'ตันบรรจุจริง');
+  }
   const s = store.get('shipments', shipmentId);
   if (!s) throw notFound('Shipment');
   if (!isISODate(date)) throw badRequest('date ต้องเป็น YYYY-MM-DD');
@@ -4646,7 +4687,7 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
     ...l,
     days: dates.map((d) => {
       const used = lineUsage(l.code, d);
-      return { date: d, used, cap: l.maxBagsPerDay, level: lineLevel(used, l.maxBagsPerDay), over: l.maxBagsPerDay ? Math.max(0, used - l.maxBagsPerDay) : 0 };
+      return { date: d, used, usedMt: lineUsageMt(l.code, d), cap: l.maxBagsPerDay, level: lineLevel(used, l.maxBagsPerDay), over: l.maxBagsPerDay ? Math.max(0, used - l.maxBagsPerDay) : 0 };
     }),
   }));
   const needle = q.trim().toLowerCase();
@@ -4697,6 +4738,7 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
       shipments: rows.length,
       shortShipments: rows.filter((r) => r.readiness.status === 'short').length,
       remainingToPlan: rows.reduce((a, r) => a + r.readiness.remainingToPlan, 0),
+      remainingToPlanMt: round(rows.reduce((a, r) => a + r.readiness.remainingToPlan * (r.mtPerBag || 0), 0), 2),
       lineOverDays: lines.reduce((a, l) => a + l.days.filter((d) => d.over > 0 && d.date >= today).length, 0),
       todayPlanned: lines.reduce((a, l) => a + (l.days.find((d) => d.date === today)?.used ?? 0), 0),
       todayCap: lines.reduce((a, l) => a + (l.maxBagsPerDay || 0), 0),
@@ -4742,7 +4784,7 @@ function packDaily(siteCode, date) {
   rows.sort((a, b) => (a.lineCode || '').localeCompare(b.lineCode || '') || a.code.localeCompare(b.code));
   const lines = linesOf(site.code).map((l) => {
     const used = lineUsage(l.code, date);
-    return { code: l.code, name: l.name, cap: l.maxBagsPerDay, used, level: lineLevel(used, l.maxBagsPerDay) };
+    return { code: l.code, name: l.name, cap: l.maxBagsPerDay, used, usedMt: lineUsageMt(l.code, date), level: lineLevel(used, l.maxBagsPerDay) };
   });
   const sum = (k) => rows.reduce((a, r) => a + (r[k] ?? 0), 0);
   return {
@@ -8068,7 +8110,7 @@ const closingText = (s) => (s.closingDate ? `${fmt.date(s.closingDate, { day: 'n
 const FIELDS = [
   ['code', 'Shipment code *', 'text'], ['customerName', 'ลูกค้า', 'text'], ['carrier', 'สายเรือ (Carrier)', 'text'],
   ['bookingNo', 'Booking no.', 'text'], ['soNo', 'SO No.', 'text'], ['product', 'สินค้า (Product) *', 'text'],
-  ['mt', 'จำนวนตันรวม (MT) *', 'number'], ['bags', 'จำนวนถุง', 'number'], ['conts', 'จำนวนตู้ (Conts) *', 'number'],
+  ['mt', 'จำนวนตันรวม (MT) *', 'number'], ['packingMtPerBag', 'น้ำหนักต่อถุง (ตัน/ถุง)', 'number'], ['bags', 'จำนวนถุง (คำนวณให้)', 'number'], ['conts', 'จำนวนตู้ (Conts) *', 'number'],
   ['containerType', 'ประเภทตู้', 'select'], ['etd', 'ETD-TH', 'date'], ['truck', 'รถขนส่ง (Truck)', 'text'],
   ['closingDate', 'Closing date', 'date'], ['closingTime', 'Closing time', 'time'],
   ['firstReturnDate', 'First Return date', 'date'], ['firstReturnTime', 'First Return time', 'time'],
@@ -8094,7 +8136,8 @@ function shipmentForm(s, kkMeta) {
       if (!opts.some((o) => o.value === v)) opts.push({ value: v, label: v });
       el = selectEl(opts, v);
     } else if (type === 'textarea') el = h('textarea.inp', { rows: 2 }, s[key] ?? '');
-    else el = h('input.inp', { type, value: s[key] ?? '', step: key === 'mt' ? '0.01' : type === 'number' ? '1' : null, min: type === 'number' ? 0 : null, placeholder: key === 'mt' ? 'เช่น 504.25' : null });
+    else el = h('input.inp', { type, value: s[key] ?? '', step: key === 'mt' || key === 'packingMtPerBag' ? '0.01' : type === 'number' ? '1' : null, min: type === 'number' ? 0 : null, placeholder: key === 'mt' ? 'เช่น 504.25' : key === 'packingMtPerBag' ? 'เช่น 1.20' : null });
+    if (key === 'packingMtPerBag' && s[key]) el.value = Number(s[key]).toFixed(2);
     inputs[key] = el;
     grid.append(field(label, el));
     if (type === 'textarea') grid.lastChild.style.gridColumn = '1 / -1';
@@ -8103,12 +8146,21 @@ function shipmentForm(s, kkMeta) {
     const out = {};
     for (const [key, , type] of FIELDS) {
       const v = inputs[key].value;
-      if (type === 'number') out[key] = v === '' ? null : key === 'mt' ? Math.round(Number(v) * 100) / 100 : Number(v);
+      if (type === 'number') out[key] = v === '' ? null : key === 'mt' || key === 'packingMtPerBag' ? Math.round(Number(v) * 100) / 100 : Number(v);
       else if (type === 'date' || type === 'time' || type === 'pack-line') out[key] = v || null;
       else out[key] = v;
     }
     return out;
   };
+  // จำนวนถุง = ตันรวม ÷ น้ำหนักต่อถุง (คำนวณให้อัตโนมัติ แก้เองได้)
+  const recalcBags = () => {
+    const mt = Number(inputs.mt.value);
+    const w = Number(inputs.packingMtPerBag.value);
+    if (mt > 0 && w > 0) inputs.bags.value = Math.round(mt / w);
+  };
+  inputs.mt.addEventListener('input', recalcBags);
+  inputs.packingMtPerBag.addEventListener('input', recalcBags);
+  if (!s.packingMtPerBag && s.mt > 0 && s.bags > 0) inputs.packingMtPerBag.placeholder = `ปัจจุบัน ${(s.mt / s.bags).toFixed(2)}`;
   return { el: grid, values };
 }
 
@@ -9152,12 +9204,12 @@ async function render(root, { rerender, kkMeta }) {
   root.append(h('div.site-banner',
     h('b', `บรรจุถุง ${site.code}`),
     h('span', `ถุงต้องบรรจุเสร็จ${k.leadDays ? ` ก่อนวันโหลด ${k.leadDays} วัน` : 'ภายในวันโหลดตู้'} · กำลังบรรจุรวม ${fmt.num(k.todayCap)} ถุง/วัน (${g.lines.length} สาย)`),
-    h('span.muted', 'ตัวเลขในช่อง = ถุงตามแผน · ✓ = ยอดจริง · 🚚 = ตู้ที่โหลดวันนั้น · ถุงยกมา = ถุงที่บรรจุไว้แล้วก่อนเริ่มใช้ระบบ')));
+    h('span.muted', 'ตัวเลขในช่อง = ตันตามแผน · ✓ = ตันบรรจุจริง · 🚚 = ตู้ที่โหลดวันนั้น · ระบบแปลงตันเป็นถุงจากน้ำหนักต่อถุงของ Shipment')));
 
   root.append(h('div.kpis',
     kpi('Shipment ที่ต้องบรรจุ', k.shipments, 'มีแผนโหลดตู้ในช่วงนี้'),
     kpi('ถุงไม่พอก่อนโหลด', k.shortShipments, 'Shipment', k.shortShipments ? 'red' : 'green'),
-    kpi('ถุงที่ยังไม่ลงแผนบรรจุ', fmt.num(k.remainingToPlan), 'กด "จัดแผนบรรจุอัตโนมัติ"', k.remainingToPlan ? 'yellow' : 'green'),
+    kpi('ยังไม่ลงแผนบรรจุ (ตัน)', fmt.num(k.remainingToPlanMt, 2), `${fmt.num(k.remainingToPlan)} ถุง · กด "จัดแผนบรรจุอัตโนมัติ"`, k.remainingToPlan ? 'yellow' : 'green'),
     kpi('วันนี้ (ถุง)', `${fmt.num(k.todayPlanned)} / ${fmt.num(k.todayCap)}`, 'แผน / กำลังบรรจุรวม', k.todayCap && k.todayPlanned > k.todayCap ? 'red' : null),
     kpi('วันนี้ (ตัน)', `${fmt.num(k.today.actualMt ?? 0, 1)} / ${fmt.num(k.today.plannedMt, 1)}`, 'บรรจุได้จริง / ตามแผน', k.today.actualMt != null && k.today.actualMt < k.today.plannedMt ? 'yellow' : null),
     kpi(`ช่วง ${g.dates.length} วัน (ตัน)`, `${fmt.num(k.range.actualMt, 1)} / ${fmt.num(k.range.plannedMt, 1)}`, `บรรจุจริง / แผน · ${fmt.num(k.range.actualBags)} / ${fmt.num(k.range.plannedBags)} ถุง`),
@@ -9189,7 +9241,7 @@ function lineTable(g, site, rerender) {
   const addBtn = h('button.btn.small', { type: 'button', onclick: () => openLineEdit(null, site, rerender) }, '+ เพิ่มสายบรรจุ');
   if (!g.lines.length) return h('div.card', h('div.card-head', h('h2', 'สายบรรจุ'), addBtn), h('div.empty', 'หน้างานนี้ยังไม่มีสายบรรจุ'));
   return h('div.card',
-    h('div.card-head', h('h2', 'กำลังบรรจุของสาย (ถุง/วัน)'), h('span.hint', 'กด ✎ เพื่อเปลี่ยนชื่อ/กำลังบรรจุ · คลิกช่องวันที่เพื่อย้ายงานไปสายอื่น · เขียว = ปกติ · เหลือง ≥85% · แดง = เกินกำลัง'), h('div.spacer'), addBtn),
+    h('div.card-head', h('h2', 'กำลังบรรจุของสาย (ตัน/วัน · กำลังเป็นถุง/วัน)'), h('span.hint', 'กด ✎ เพื่อเปลี่ยนชื่อ/กำลังบรรจุ · คลิกช่องวันที่เพื่อย้ายงานไปสายอื่น · เขียว = ปกติ · เหลือง ≥85% · แดง = เกินกำลัง'), h('div.spacer'), addBtn),
     h('div.pgrid-wrap', { style: { maxHeight: 'none' } }, h('table.pgrid',
       h('thead', h('tr', h('th.sticky-col', 'สายบรรจุ'), h('th.num', 'กำลัง/วัน'), g.dates.map((d) => dayHead(d, g.today)))),
       h('tbody', g.lines.map((l) => {
@@ -9203,7 +9255,7 @@ function lineTable(g, site, rerender) {
           l.days.map((d) => h(`td.cnt-cell.${d.level}${d.date === g.today ? '.today' : ''}`, {
             title: `${d.used}/${d.cap ?? '-'} ถุง — คลิกเพื่อดู/ย้ายงาน`, style: { cursor: d.used ? 'pointer' : null },
             onclick: () => { if (d.used) openLineDay(l, d.date, g.lines, site, rerender); },
-          }, d.used ? h('b', fmt.num(d.used)) : '', d.over ? h('div.over', `+${d.over}`) : '')));
+          }, d.used ? [h('b', fmt.num(d.usedMt, 1)), h('div.sub', `${fmt.num(d.used)} ถุง`)] : '', d.over ? h('div.over', `+${d.over} ถุง`) : '')));
       })))));
 }
 
@@ -9259,12 +9311,13 @@ async function openLineDay(l, date, lines, site, rerender) {
     const d = await api.get(`/kk/packing/daily?site=${encodeURIComponent(site.code)}&date=${date}`);
     const rows = d.rows.filter((r) => r.lineCode === l.code && r.recordId);
     body.replaceChildren(
-      h('div.stat-row', h('span', 'สาย ', h('b', l.code)), h('span', 'วันที่ ', h('b', fmt.dateLong(date))), h('span', 'รวม ', h('b', fmt.num(rows.reduce((a, r) => a + (r.plannedBags || 0), 0))), ` / ${fmt.num(l.maxBagsPerDay)} ถุง`)),
+      h('div.stat-row', h('span', 'สาย ', h('b', l.code)), h('span', 'วันที่ ', h('b', fmt.dateLong(date))), h('span', 'รวม ', h('b', fmt.num(rows.reduce((a, r) => a + (r.plannedMt || 0), 0), 2)), ' ตัน · ', fmt.num(rows.reduce((a, r) => a + (r.plannedBags || 0), 0)), ` / ${fmt.num(l.maxBagsPerDay)} ถุง`)),
       rows.length ? h('div.grid-wrap', h('table.grid',
-        h('thead', h('tr', ['Shipment', 'ถุงตามแผน', 'ถุงจริง', 'ย้ายไปสาย'].map((t) => h('th', t)))),
+        h('thead', h('tr', ['Shipment', 'ตันตามแผน', 'ตันจริง', 'ย้ายไปสาย'].map((t) => h('th', t)))),
         h('tbody', rows.map((r) => {
-          const p = h('input.cell', { type: 'number', min: 0, step: 1, value: r.plannedBags ?? 0, disabled: r.rolledOver });
-          p.onchange = async () => { if (await withValidation((force) => api.put('/kk/packing/records', { shipmentId: r.shipmentId, date, lineCode: l.code, plannedBags: Number(p.value || 0), force }))) { dirty = true; draw(); } };
+          const w = r.mtPerBag || 0;
+          const p = h('input.cell', { type: 'number', min: 0, step: w ? '0.01' : 1, value: w ? Number(((r.plannedBags ?? 0) * w).toFixed(2)) : r.plannedBags ?? 0, disabled: r.rolledOver });
+          p.onchange = async () => { if (await withValidation((force) => api.put('/kk/packing/records', { shipmentId: r.shipmentId, date, lineCode: l.code, ...(w ? { plannedMt: Number(p.value || 0) } : { plannedBags: Math.round(Number(p.value || 0)) }), force }))) { dirty = true; draw(); } };
           const sel = selectEl(lines.map((x) => ({ value: x.code, label: x.code })), l.code);
           sel.onchange = async () => {
             if (sel.value === l.code) return;
@@ -9277,7 +9330,7 @@ async function openLineDay(l, date, lines, site, rerender) {
             toast(`ย้าย ${r.code} ไปสาย ${sel.value} แล้ว`, 'success', 1800);
             draw();
           };
-          return h('tr', h('td.ro', h('b.mono', r.code), h('div.sub', r.product || '')), h('td', p), h('td.ro.num', r.actualBags ?? '–'), h('td', sel));
+          return h('tr', h('td.ro', h('b.mono', r.code), h('div.sub', r.product || '')), h('td', p), h('td.ro.num', r.actualMt == null ? '–' : fmt.num(r.actualMt, 2)), h('td', sel));
         })))) : h('div.empty', 'ไม่มีงานบรรจุในสายนี้วันนี้แล้ว'));
   };
   await draw();
@@ -9287,11 +9340,11 @@ async function openLineDay(l, date, lines, site, rerender) {
 function mainTable(g, site, rerender) {
   const lineOpts = g.lines.map((l) => ({ value: l.code, label: l.code }));
   const head = h('tr',
-    h('th.sticky-col', 'Shipment'), h('th', 'สินค้า / Bag'), h('th', 'Loading ถัดไป'), h('th', 'สาย'), h('th.num', 'ถุงทั้งหมด'), h('th.num', 'ถุงยกมา'), h('th', 'บรรจุจริง / ลงแผน (ถุง)'),
+    h('th.sticky-col', 'Shipment'), h('th', 'สินค้า / Bag'), h('th', 'Loading ถัดไป'), h('th', 'สาย'), h('th.num', 'ตันทั้งหมด'), h('th.num', 'ถุงยกมา'), h('th', 'บรรจุจริง / ลงแผน (ตัน)'),
     g.dates.map((d) => dayHead(d, g.today)));
   const totalRow = h('tr.total',
     h('td.sticky-col', h('b', 'รวมตัน/วัน'), h('div.sub', 'บรรจุจริง / แผน (ตัน)')),
-    h('td', { colSpan: 6 }, h('span.muted', 'ตัน = ถุง × (MT ÷ จำนวนถุงของ Shipment)')),
+    h('td', { colSpan: 6 }, h('span.muted', 'ตัน = ถุง × น้ำหนักต่อถุง (ตัน/ถุง)')),
     g.dates.map((d) => {
       const t = d.totals;
       const short = t.actualMt != null && t.actualMt < t.plannedMt;
@@ -9301,6 +9354,8 @@ function mainTable(g, site, rerender) {
   const body = h('tbody');
   g.rows.forEach((r, ri) => {
     const rd = r.readiness;
+    const w = r.mtPerBag || 0; // ตัน/ถุง
+    const T = (bags, dg = 2) => (w ? fmt.num(bags * w, dg) : `${fmt.num(bags)} ถุง`);
     const tr = h(`tr.lv-${r.worst}`);
     tr.append(h('td.sticky-col',
       h('div.ship-head',
@@ -9311,55 +9366,67 @@ function mainTable(g, site, rerender) {
           h('button.icon-btn.del', { type: 'button', title: 'ลบแผนบรรจุของ Shipment นี้', onclick: () => clearPackPlan(r, rerender) }, '🗑'))),
       h('div.sub', r.customerName || '—'),
       h('div', { style: { marginTop: '2px' } }, badge(...(READY[rd.status] ?? [rd.status, 'gray'])),
-        rd.firstShort ? h('div.sub', { style: { color: 'var(--red)' } }, `ขาด ${fmt.num(rd.firstShort.short)} ถุง · โหลด ${fmt.date(rd.firstShort.date, { day: 'numeric', month: 'short' })}`) : null)));
-    tr.append(h('td', h('div', r.product), h('div.sub', `${r.bagType || '-'} · ${fmt.num(rd.per, 1)} ถุง/ตู้`)));
+        rd.firstShort ? h('div.sub', { style: { color: 'var(--red)' } }, `ขาด ${T(rd.firstShort.short)} ตัน · โหลด ${fmt.date(rd.firstShort.date, { day: 'numeric', month: 'short' })}`) : null)));
+    tr.append(h('td', h('div', r.product), h('div.sub', `${r.bagType || '-'} · ${w ? `${w.toFixed(2)} ตัน/ถุง` : 'ยังไม่มีน้ำหนักต่อถุง'}`)));
     const nextChk = rd.checks?.[0];
-    tr.append(h('td.nowrap', nextChk ? [h('b', fmt.date(nextChk.date, { day: 'numeric', month: 'short' })), h('div.sub', `${nextChk.conts} ตู้ · ${fmt.num(Math.round(nextChk.conts * rd.per))} ถุง`)] : h('span.muted', '–')));
+    tr.append(h('td.nowrap', nextChk ? [h('b', fmt.date(nextChk.date, { day: 'numeric', month: 'short' })), h('div.sub', `${nextChk.conts} ตู้ · ${T(Math.round(nextChk.conts * rd.per))} ตัน`)] : h('span.muted', '–')));
     tr.append(h('td', selectEl(lineOpts, r.line, {
       style: { padding: '3px 6px' },
       onchange: async (e) => {
         try { await api.patch(`/kk/shipments/${r.id}`, { packLine: e.target.value, force: true }); toast(`ตั้งสายบรรจุ ${r.code} = ${e.target.value}`, 'success', 1500); rerender(); } catch (err) { toast(err.message, 'error'); }
       },
     })));
-    tr.append(h('td.num', h('b', fmt.num(r.bags)), h('div.sub', `${fmt.num(r.mt, 1)} ตัน`)));
+    tr.append(h('td.num', h('b', fmt.num(r.mt, 2)), h('div.sub', `${fmt.num(r.bags)} ถุง`)));
     const op = h('input.inp', { type: 'number', min: 0, step: 1, value: r.packOpening || '', placeholder: '0', style: { width: '76px', textAlign: 'right' } });
     op.addEventListener('change', async () => {
       try { await api.patch(`/kk/shipments/${r.id}`, { packOpening: op.value === '' ? 0 : Number(op.value), force: true }); rerender(); } catch (err) { toast(err.message, 'error'); }
     });
     tr.append(h('td.num', op,
-      r.carryIn ? h('div.sub', { style: { color: 'var(--green)' } }, `+${fmt.num(r.carryIn)} รับยก`) : null,
-      r.carryOut ? h('div.sub', { style: { color: 'var(--primary)' } }, `−${fmt.num(r.carryOut)} ยกออก`) : null));
-    tr.append(h('td.nowrap', h('div', `${fmt.num(rd.packedActual)} / ${fmt.num(rd.plannedOrPacked)}`),
-      h('div.sub', rd.remainingToPlan ? `ยังไม่ลงแผน ${fmt.num(rd.remainingToPlan)}` : rd.overPlanned ? `แผนเกิน ${fmt.num(rd.overPlanned)}` : rd.packedDone >= r.bags ? 'บรรจุครบ' : 'ลงแผนครบ'),
+      r.packOpening && w ? h('div.sub', `= ${T(r.packOpening)} ตัน`) : null,
+      r.carryIn ? h('div.sub', { style: { color: 'var(--green)' } }, `+${T(r.carryIn)} ตัน รับยก`) : null,
+      r.carryOut ? h('div.sub', { style: { color: 'var(--primary)' } }, `−${T(r.carryOut)} ตัน ยกออก`) : null));
+    tr.append(h('td.nowrap', h('div', `${T(rd.packedActual)} / ${T(rd.plannedOrPacked)}`),
+      h('div.sub', rd.remainingToPlan ? `ยังไม่ลงแผน ${T(rd.remainingToPlan)} ตัน` : rd.overPlanned ? `แผนเกิน ${T(rd.overPlanned)} ตัน` : rd.packedDone >= r.bags ? 'บรรจุครบ' : 'ลงแผนครบ'),
       r.packFirst ? h('div.sub', `แผนบรรจุ ${fmt.date(r.packFirst, { day: 'numeric', month: 'short' })}${r.packLast !== r.packFirst ? `–${fmt.date(r.packLast, { day: 'numeric', month: 'short' })}` : ''}`) : null));
 
     g.dates.forEach((d, ci) => {
       const c = r.cells[d.date];
-      const cls = ['pc', d.date === g.today && 'today', d.closed && 'off', c.short && 'late', c.actual != null && c.actual >= c.planned && c.planned && 'done'].filter(Boolean).join('.');
+      // เขียว = บันทึกจริงแล้วและได้ตามแผน (รวมกรณีบรรจุโดยไม่มีแผนวันนั้น) · เหลือง = บันทึกแล้วแต่ได้น้อยกว่าแผน · ส้ม = วันผ่านไปแล้วยังไม่บันทึกยอดจริง
+      const st = c.actual != null ? (c.actual >= c.planned ? 'done' : 'under') : d.past && c.planned ? 'nogo' : '';
+      const cls = ['pc', d.date === g.today && 'today', d.closed && 'off', c.short && 'late', st].filter(Boolean).join('.');
       const td = h(`td.${cls}`, { title: `${r.code} ${d.date} — แผน ${c.planned} ถุง (${c.plannedMt ?? 0} ตัน)${c.actual != null ? `, จริง ${c.actual} ถุง (${c.actualMt} ตัน)` : ''}${c.loadConts ? ` | โหลด ${c.loadConts} ตู้ (${c.loadBags} ถุง)` : ''}${c.short ? ` | ขาด ${c.short} ถุง` : ''}` });
       if (d.past) {
-        td.append(c.planned || c.actual != null ? h('span.past', c.actual != null ? `✓${c.actual}` : `${c.planned}`) : '');
+        // วันที่ผ่านมาแล้ว: คลิกเพื่อแก้แผน / ยอดจริง
+        td.classList.add('clickable');
+        td.title += ' — คลิกเพื่อแก้ไข';
+        td.addEventListener('click', () => openCellEdit(r, d.date, rerender));
+        td.append(c.planned || c.actual != null
+          ? h('span.past', c.actual != null ? `✓${T(c.actual, 1)}` : `${T(c.planned, 1)}`, c.actual != null && c.planned && c.actual !== c.planned ? h('div.sub', `แผน ${T(c.planned, 1)}`) : c.actual == null ? h('div.sub', 'ยังไม่บันทึก') : null)
+          : h('span.muted', '+'));
       } else {
-        const inp = h('input.pcell', { type: 'number', min: 0, step: 1, value: c.planned || '', 'data-r': ri, 'data-c': ci });
+        // กรอกเป็นตัน (ทศนิยม 2 ตำแหน่ง) — ระบบแปลงเป็นถุงเต็มตามน้ำหนักต่อถุง
+        const shown = c.planned ? (w ? Number((c.planned * w).toFixed(2)) : c.planned) : '';
+        const inp = h('input.pcell', { type: 'number', min: 0, step: w ? '0.01' : 1, value: shown, 'data-r': ri, 'data-c': ci, title: w ? `ตัน (${fmt.num(w, 2)} ตัน/ถุง)` : 'ยังไม่มีน้ำหนักต่อถุง — กรอกเป็นถุง' });
         inp.addEventListener('change', async () => {
           const v = inp.value === '' ? 0 : Number(inp.value);
-          if (!Number.isInteger(v) || v < 0) { toast('จำนวนถุงต้องเป็นจำนวนเต็ม ≥ 0', 'error'); inp.value = c.planned || ''; return; }
-          await withValidation((force) => api.put('/kk/packing/records', { shipmentId: r.id, date: d.date, lineCode: r.line, plannedBags: v, force }));
+          if (!(v >= 0)) { toast('ต้องเป็นตัวเลข ≥ 0', 'error'); inp.value = shown; return; }
+          const body = w ? { plannedMt: v } : { plannedBags: Math.round(v) };
+          await withValidation((force) => api.put('/kk/packing/records', { shipmentId: r.id, date: d.date, lineCode: r.line, ...body, force }));
           rerender();
         });
         inp.addEventListener('keydown', (e) => navKey(e, ri, ci));
         td.append(inp);
-        if (c.actual != null) td.append(h('span.lockdot', { style: { color: 'var(--green)' } }, `✓${c.actual}`));
+        if (c.actual != null) td.append(h('span.lockdot', { style: { color: 'var(--green)' } }, `✓${T(c.actual, 1)}`));
       }
       if (c.loadConts) td.append(h('span.mark.fr', { style: { background: c.short ? 'var(--red-bar)' : '#94a3b8', color: '#fff' } }, `🚚${c.loadConts}`));
-      if (c.short) td.append(h('span.mark.cl', `-${c.short}`));
+      if (c.short) td.append(h('span.mark.cl', `-${T(c.short, 1)}`));
       tr.append(td);
     });
     body.append(tr);
   });
   if (!g.rows.length) body.append(h('tr', h('td', { colSpan: 7 + g.dates.length }, h('div.empty', 'ไม่มี Shipment ที่ต้องบรรจุถุงในช่วงนี้ (ลงแผนโหลดตู้ก่อนที่หน้า "แผนตู้รายวัน")'))));
   return h('div.card',
-    h('div.card-head', h('h2', `แผนบรรจุถุงรายวัน (${g.rows.length} Shipment)`), h('span.hint', 'พิมพ์จำนวนถุงในช่องวันที่ · Enter/↑↓←→ เลื่อนช่อง · ช่องแดง = ถุงไม่พอสำหรับตู้ที่โหลดวันนั้น')),
+    h('div.card-head', h('h2', `แผนบรรจุถุงรายวัน (${g.rows.length} Shipment)`), h('span.hint', 'พิมพ์จำนวนตันในช่องวันที่ (ทศนิยม 2 ตำแหน่ง) · วันที่ผ่านมาแล้วคลิกเพื่อแก้ · Enter/↑↓←→ เลื่อนช่อง · ช่องแดง = ถุงไม่พอสำหรับตู้ที่โหลดวันนั้น')),
     h('div.pgrid-wrap', { 'data-grid': 'kkpack' }, h('table.pgrid', h('thead', head, totalRow), body)));
 }
 
@@ -9497,7 +9564,10 @@ async function clearPackPlan(r, rerender) {
 async function openPackEdit(shipmentId, rerender) {
   let d = await api.get(`/kk/packing/shipment/${shipmentId}`);
   const s = d.shipment;
-  const mpb = s.bags > 0 && s.mt > 0 ? s.mt / s.bags : 0;
+  const mpb = s.packingMtPerBag > 0 ? Number(s.packingMtPerBag) : s.bags > 0 && s.mt > 0 ? s.mt / s.bags : 0;
+  const tq = (bags) => (bags == null ? '' : mpb ? Number((bags * mpb).toFixed(2)) : bags);
+  const unit = mpb ? 'ตัน' : 'ถุง';
+  const toPayload = (key, v) => (v === '' ? (key === 'a' ? (mpb ? { actualMt: null } : { actualBags: null }) : (mpb ? { plannedMt: 0 } : { plannedBags: 0 })) : mpb ? (key === 'a' ? { actualMt: Number(v) } : { plannedMt: Number(v) }) : (key === 'a' ? { actualBags: Math.round(Number(v)) } : { plannedBags: Math.round(Number(v)) }));
   const lineOpts = d.lines.map((l) => ({ value: l.code, label: l.code }));
   const body = h('div', { style: { display: 'grid', gap: '10px' } });
   let dirty = false;
@@ -9512,30 +9582,30 @@ async function openPackEdit(shipmentId, rerender) {
     const ta = recs.reduce((a, x) => a + (x.actualBags ?? 0), 0);
     const dateInp = h('input.inp', { type: 'date', value: addDays(new Date().toISOString().slice(0, 10), 1) });
     const lineSel = selectEl(lineOpts, s.packLine || lineOpts[0]?.value);
-    const pInp = h('input.inp', { type: 'number', min: 0, step: 1, placeholder: 'ถุงตามแผน', style: { width: '110px' } });
-    const aInp = h('input.inp', { type: 'number', min: 0, step: 1, placeholder: 'ถุงจริง', style: { width: '110px' } });
+    const pInp = h('input.inp', { type: 'number', min: 0, step: mpb ? '0.01' : 1, placeholder: `${unit}ตามแผน`, style: { width: '120px' } });
+    const aInp = h('input.inp', { type: 'number', min: 0, step: mpb ? '0.01' : 1, placeholder: `${unit}จริง`, style: { width: '120px' } });
     body.replaceChildren(
       h('div.stat-row',
-        h('span', 'ถุงทั้งหมด ', h('b', fmt.num(s.bags)), ` (${fmt.num(s.mt, 1)} ตัน)`),
-        h('span', 'ลงแผนแล้ว ', h('b', fmt.num(tp)), ` ถุง = ${fmt.num(tp * mpb, 1)} ตัน`),
-        h('span', 'บรรจุจริง ', h('b', fmt.num(ta)), ` ถุง = ${fmt.num(ta * mpb, 1)} ตัน`),
-        h('span.muted', `${fmt.num(mpb, 3)} ตัน/ถุง`),
-        d.carryOut ? badge(`ยกออก ${fmt.num(d.carryOut)} ถุง → ${d.transfers.filter((t) => t.fromId === s.id).map((t) => t.toCode).join(', ')}`, 'blue') : null,
-        d.carryIn ? badge(`รับยกมา ${fmt.num(d.carryIn)} ถุง ← ${d.transfers.filter((t) => t.toId === s.id).map((t) => t.fromCode).join(', ')}`, 'green') : null),
+        h('span', 'ทั้งหมด ', h('b', fmt.num(s.mt, 2)), ` ตัน (${fmt.num(s.bags)} ถุง)`),
+        h('span', 'ลงแผนแล้ว ', h('b', fmt.num(tp * mpb, 2)), ` ตัน (${fmt.num(tp)} ถุง)`),
+        h('span', 'บรรจุจริง ', h('b', fmt.num(ta * mpb, 2)), ` ตัน (${fmt.num(ta)} ถุง)`),
+        h('span.muted', mpb ? `${fmt.num(mpb, 2)} ตัน/ถุง` : 'ยังไม่มีน้ำหนักต่อถุง — กรอกเป็นถุง'),
+        d.carryOut ? badge(`ยกออก ${fmt.num(d.carryOut * mpb, 2)} ตัน → ${d.transfers.filter((t) => t.fromId === s.id).map((t) => t.toCode).join(', ')}`, 'blue') : null,
+        d.carryIn ? badge(`รับยกมา ${fmt.num(d.carryIn * mpb, 2)} ตัน ← ${d.transfers.filter((t) => t.toId === s.id).map((t) => t.fromCode).join(', ')}`, 'green') : null),
       recs.length ? h('div.grid-wrap', { style: { maxHeight: '340px' } }, h('table.grid',
-        h('thead', h('tr', ['วันที่บรรจุ', 'สาย', 'ถุงตามแผน', 'ถุงจริง', 'ตัน (แผน / จริง)', 'หมายเหตุ', ''].map((t) => h('th', t)))),
+        h('thead', h('tr', ['วันที่บรรจุ', 'สาย', `${unit}ตามแผน`, `${unit}บรรจุจริง`, 'ถุง (แผน / จริง)', 'หมายเหตุ', ''].map((t) => h('th', t)))),
         h('tbody', recs.map((x) => {
-          const p = h('input.cell', { type: 'number', min: 0, step: 1, value: x.plannedBags ?? 0, disabled: !!x.rolledOver });
-          const a = h('input.cell', { type: 'number', min: 0, step: 1, value: x.actualBags ?? '', placeholder: '–' });
+          const p = h('input.cell', { type: 'number', min: 0, step: mpb ? '0.01' : 1, value: tq(x.plannedBags ?? 0), disabled: !!x.rolledOver });
+          const a = h('input.cell', { type: 'number', min: 0, step: mpb ? '0.01' : 1, value: tq(x.actualBags), placeholder: '–' });
           const n = h('input.cell', { value: x.note || '' });
-          p.onchange = () => save({ date: x.date, lineCode: x.lineCode, plannedBags: p.value === '' ? 0 : Number(p.value) });
-          a.onchange = () => save({ date: x.date, lineCode: x.lineCode, actualBags: a.value === '' ? null : Number(a.value) });
+          p.onchange = () => save({ date: x.date, lineCode: x.lineCode, ...toPayload('p', p.value) });
+          a.onchange = () => save({ date: x.date, lineCode: x.lineCode, ...toPayload('a', a.value) });
           n.onchange = () => save({ date: x.date, lineCode: x.lineCode, note: n.value });
           return h('tr',
             h('td.ro', h('b', fmt.date(x.date)), x.rolledOver ? h('div.sub', 'ปัดยอดแล้ว') : null),
             h('td.ro', x.lineCode),
             h('td', p), h('td', a),
-            h('td.ro.num', `${fmt.num((x.plannedBags ?? 0) * mpb, 1)} / ${x.actualBags == null ? '–' : fmt.num(x.actualBags * mpb, 1)}`),
+            h('td.ro.num', `${fmt.num(x.plannedBags ?? 0)} / ${x.actualBags == null ? '–' : fmt.num(x.actualBags)}`),
             h('td', n),
             h('td.grid-actions', h('button.icon-btn.del', {
               type: 'button', title: 'ลบรายการนี้',
@@ -9549,13 +9619,13 @@ async function openPackEdit(shipmentId, rerender) {
         onsubmit: async (e) => {
           e.preventDefault();
           if (!dateInp.value) return toast('เลือกวันที่บรรจุ', 'warn');
-          if (pInp.value === '' && aInp.value === '') return toast('กรอกถุงตามแผนหรือถุงจริง', 'warn');
+          if (pInp.value === '' && aInp.value === '') return toast(`กรอก${unit}ตามแผนหรือ${unit}จริง`, 'warn');
           const payload = { date: dateInp.value, lineCode: lineSel.value };
-          if (pInp.value !== '') payload.plannedBags = Number(pInp.value);
-          if (aInp.value !== '') payload.actualBags = Number(aInp.value);
+          if (pInp.value !== '') Object.assign(payload, toPayload('p', pInp.value));
+          if (aInp.value !== '') Object.assign(payload, toPayload('a', aInp.value));
           await save(payload);
         },
-      }, field('วันที่บรรจุ', dateInp), field('สาย', lineSel), field('ถุงตามแผน', pInp), field('ถุงจริง', aInp), h('button.btn.primary', { type: 'submit' }, '+ เพิ่มรายการ')));
+      }, field('วันที่บรรจุ', dateInp), field('สาย', lineSel), field(`${unit}ตามแผน`, pInp), field(`${unit}บรรจุจริง`, aInp), h('button.btn.primary', { type: 'submit' }, '+ เพิ่มรายการ')));
   };
   draw();
   modal({
@@ -9563,6 +9633,50 @@ async function openPackEdit(shipmentId, rerender) {
     body,
     actions: [{ label: 'ปิด', cls: 'primary', onClick: (c) => c() }],
     onClose: () => { if (dirty) rerender(); },
+  });
+}
+
+// ---------- แก้ไขช่องวันที่ (แผน / ยอดจริง) ของ Shipment ----------
+async function openCellEdit(r, date, rerender) {
+  const d = await api.get(`/kk/packing/shipment/${r.id}`);
+  const recs = d.records.filter((x) => x.date === date);
+  const lines = d.lines.map((l) => ({ value: l.code, label: l.code }));
+  const w = r.mtPerBag || 0;
+  const unit = w ? 'ตัน' : 'ถุง';
+  const tq = (bags) => (bags == null ? '' : w ? Number((bags * w).toFixed(2)) : bags);
+  const rows = (recs.length ? recs : [{ id: null, lineCode: r.line || lines[0]?.value, plannedBags: 0, actualBags: null, note: '' }]).map((x) => ({
+    x,
+    line: selectEl(lines, x.lineCode, { disabled: !!x.id }),
+    plan: h('input.inp', { type: 'number', min: 0, step: w ? '0.01' : 1, value: tq(x.originalPlannedBags ?? x.plannedBags ?? 0), style: { width: '120px' } }),
+    act: h('input.inp', { type: 'number', min: 0, step: w ? '0.01' : 1, value: tq(x.actualBags), placeholder: 'ยังไม่บันทึก', style: { width: '120px' } }),
+  }));
+  modal({
+    title: `${r.code} · ${fmt.dateLong(date)}`, narrow: true,
+    body: h('div', { style: { display: 'grid', gap: '10px' } },
+      h('div.sub', `แก้${unit}ตามแผน / บรรจุจริงของวันนี้${w ? ` (${fmt.num(w, 2)} ตัน/ถุง — ระบบแปลงเป็นถุงเต็ม)` : ''} — ลบตัวเลขช่องบรรจุจริงให้ว่าง = ยกเลิกยอดจริง`),
+      rows.map((o) => h('div.addrow', { style: { border: 0, padding: 0 } }, field('สาย', o.line), field(`${unit}ตามแผน`, o.plan), field(`${unit}บรรจุจริง`, o.act)))),
+    actions: [
+      { label: 'ยกเลิก', onClick: (c) => c() },
+      {
+        label: 'บันทึก', cls: 'primary',
+        onClick: async (close) => {
+          const carry = [];
+          for (const o of rows) {
+            const plan = o.plan.value === '' ? 0 : Number(o.plan.value);
+            const act = o.act.value === '' ? null : Number(o.act.value);
+            if (![plan, act ?? 0].every((v) => v >= 0)) return toast('ต้องเป็นตัวเลข ≥ 0', 'error');
+            const qty = w ? { plannedMt: plan, actualMt: act } : { plannedBags: Math.round(plan), actualBags: act == null ? null : Math.round(act) };
+            const res = await withValidation((force) => api.put('/kk/packing/records', { shipmentId: r.id, date, lineCode: o.line.value, ...qty, force }));
+            if (!res) return;
+            carry.push(...(res.carry || []));
+          }
+          close();
+          showCarry(carry);
+          toast('บันทึกแล้ว', 'success', 1500);
+          rerender();
+        },
+      },
+    ],
   });
 }
 
@@ -9583,9 +9697,10 @@ const d2 = (iso) => fmt.date(iso, { day: 'numeric', month: 'short' });
 /** แจ้งผลการยกยอดถุงอัตโนมัติ */
 function showCarry(carry) {
   if (!carry?.length) return;
-  const msg = carry.map((m) => (m.type === 'out' ? `ยก ${fmt.num(m.bags)} ถุง ${m.from} → ${m.to}`
-    : m.type === 'back' ? `ดึงคืน ${fmt.num(m.bags)} ถุง ${m.from} → ${m.to}`
-      : `${m.from} บรรจุเกิน ${fmt.num(m.bags)} ถุง — ไม่มี Shipment ถัดไปที่รหัสสินค้า ${m.product || ''} ตรงกันให้รับยกยอด`)).join(' · ');
+  const q = (m) => (m.mt ? `${fmt.num(m.mt, 2)} ตัน (${fmt.num(m.bags)} ถุง)` : `${fmt.num(m.bags)} ถุง`);
+  const msg = carry.map((m) => (m.type === 'out' ? `ยก ${q(m)} ${m.from} → ${m.to}`
+    : m.type === 'back' ? `ดึงคืน ${q(m)} ${m.from} → ${m.to}`
+      : `${m.from} บรรจุเกิน ${q(m)} — ไม่มี Shipment ถัดไปที่รหัสสินค้า ${m.product || ''} ตรงกันให้รับยกยอด`)).join(' · ');
   toast(`ยกยอดถุง (${carry[0].product || ''}): ${msg}`, carry.some((m) => m.type === 'nowhere') ? 'warn' : 'success', 7000);
 }
 
@@ -9614,7 +9729,7 @@ async function render(root, { rerender, kkMeta }) {
         if (!(await confirmDialog('กรอกยอดจริง = แผน', `กรอกยอดบรรจุจริงเท่ากับแผนให้ ${s.pending} รายการที่ยังไม่ได้กรอก?`))) return;
         const carry = [];
         for (const r of b.rows.filter((x) => x.status === 'pending' && x.plannedBags > 0)) {
-          const res = await api.put('/kk/packing/records', { shipmentId: r.shipmentId, date: r.date, lineCode: r.lineCode, actualBags: r.plannedBags, force: true });
+          const res = await api.put('/kk/packing/records', { shipmentId: r.shipmentId, date: r.date, lineCode: r.lineCode, actualBags: r.plannedBags, force: true }); // จริง = แผน
           carry.push(...(res.carry || []));
         }
         showCarry(carry);
@@ -9631,8 +9746,8 @@ async function render(root, { rerender, kkMeta }) {
   root.append(h('div.card', h('div.card-body', { style: { display: 'grid', gap: '10px' } },
     b.lines?.length ? h('div.util-pair', b.lines.map((l) => progressBar({ label: `${l.code} ${l.name || ''}`, value: l.used, max: l.cap || l.used || 1, unit: 'ถุง', level: l.level, digits: 0 }))) : null,
     h('div.stat-row',
-      h('span', 'แผน ', h('b', fmt.num(s.planned)), ' ถุง = ', h('b', fmt.num(s.plannedMt, 2)), ' ตัน'),
-      h('span', 'บรรจุได้จริง ', h('b', fmt.num(s.actual)), ' ถุง = ', h('b', { style: { color: s.entered && s.actualMt < s.plannedMt ? 'var(--yellow)' : 'var(--green)' } }, fmt.num(s.actualMt, 2)), ' ตัน'),
+      h('span', 'แผน ', h('b', fmt.num(s.plannedMt, 2)), ` ตัน (${fmt.num(s.planned)} ถุง)`),
+      h('span', 'บรรจุได้จริง ', h('b', { style: { color: s.entered && s.actualMt < s.plannedMt ? 'var(--yellow)' : 'var(--green)' } }, fmt.num(s.actualMt, 2)), ` ตัน (${fmt.num(s.actual)} ถุง)`),
       h('span', 'บันทึกแล้ว ', h('b', s.entered), ` / ${b.rows.length} รายการ`),
       s.short ? h('span', badge(`ขาด ${s.short}`, 'yellow')) : null, s.over ? h('span', badge(`เกิน ${s.over}`, 'red')) : null,
       single ? h('span.muted', b.lead ? `ถุงต้องเสร็จก่อนวันโหลด ${b.lead} วัน` : 'บรรจุเสร็จภายในวันโหลดได้') : null),
@@ -9642,17 +9757,16 @@ async function render(root, { rerender, kkMeta }) {
     ...(single ? [] : [{ key: 'date', label: 'วันที่บรรจุ', render: (r) => h('b', `${fmt.date(r.date, { weekday: 'short', day: 'numeric', month: 'short' })}`) }]),
     { key: 'lineCode', label: 'สาย', render: (r) => h('b', r.lineCode) },
     { key: 'code', label: 'Shipment', render: (r) => h('span', h('span.mono', r.code), h('div.sub', r.customerName || ''),
-      r.carryOut ? h('div', badge(`ยกออก ${fmt.num(r.carryOut)} ถุง`, 'blue')) : null,
-      r.carryIn ? h('div', badge(`รับยกมา ${fmt.num(r.carryIn)} ถุง`, 'green')) : null) },
+      r.carryOut ? h('div', badge(`ยกออก ${fmt.num(r.carryOut * (r.mtPerBag || 0), 2)} ตัน`, 'blue')) : null,
+      r.carryIn ? h('div', badge(`รับยกมา ${fmt.num(r.carryIn * (r.mtPerBag || 0), 2)} ตัน`, 'green')) : null) },
     { key: 'product', label: 'สินค้า / Bag', render: (r) => h('span', r.product, h('div.sub', r.bagType || '-')) },
-    { key: 'nextLoad', label: 'Loading date', render: (r) => (r.nextLoad ? h('span', h('b', d2(r.nextLoad)), r.loadConts ? h('div.sub', `🚚 ${r.loadConts} ตู้ · ${fmt.num(r.loadBags)} ถุง`) : null) : '–') },
-    { key: 'plannedBags', label: 'แผน (ถุง)', type: 'number', editable: (r) => !r.rolledOver, num: true, step: 1, min: 0, width: '100px' },
-    { key: 'actualBags', label: 'บรรจุจริง ✎', type: 'number', editable: true, num: true, step: 1, min: 0, width: '110px' },
-    { key: 'plannedMt', label: 'แผน (ตัน)', num: true, render: (r) => fmt.num(r.plannedMt, 2) },
-    { key: 'actualMt', label: 'จริง (ตัน)', num: true, render: (r) => (r.actualMt == null ? '–' : h('b', fmt.num(r.actualMt, 2))) },
-    { key: 'variance', label: 'ส่วนต่าง (ถุง / ตัน)', num: true, render: (r) => (r.variance == null ? '–' : h('b', { style: { color: r.variance > 0 ? 'var(--yellow)' : r.variance < 0 ? 'var(--red)' : 'var(--green)' } }, fmt.signed(-r.variance), h('div.sub', `${fmt.signed(-r.varianceMt, 2)} ตัน`))) },
+    { key: 'nextLoad', label: 'Loading date', render: (r) => (r.nextLoad ? h('span', h('b', d2(r.nextLoad)), r.loadConts ? h('div.sub', `🚚 ${r.loadConts} ตู้ · ${fmt.num(r.loadBags * (r.mtPerBag || 0), 2)} ตัน`) : null) : '–') },
+    { key: 'plannedMt', label: 'แผน (ตัน)', type: 'number', editable: (r) => !r.rolledOver, num: true, step: '0.01', min: 0, width: '110px', digits: 2 },
+    { key: 'actualMt', label: 'บรรจุจริง (ตัน) ✎', type: 'number', editable: true, num: true, step: '0.01', min: 0, width: '120px', digits: 2 },
+    { key: 'bags', label: 'ถุง (แผน / จริง)', num: true, render: (r) => h('span.muted', `${fmt.num(r.plannedBags)} / ${r.actualBags == null ? '–' : fmt.num(r.actualBags)}`) },
+    { key: 'variance', label: 'ส่วนต่าง (ตัน)', num: true, render: (r) => (r.variance == null ? '–' : h('b', { style: { color: r.variance > 0 ? 'var(--yellow)' : r.variance < 0 ? 'var(--red)' : 'var(--green)' } }, fmt.signed(-r.varianceMt, 2), h('div.sub', `${fmt.signed(-r.variance)} ถุง`))) },
     { key: 'status', label: 'สถานะ', render: (r) => h('span', badge(...STATUS[r.status]), r.rolledOver ? h('div.sub', 'ปัดยอดแล้ว') : null) },
-    { key: 'total', label: 'สะสม / ถุงทั้งหมด', render: (r) => h('span', { style: { color: r.packedTotal - r.carryOut > r.shipmentBags ? 'var(--red)' : null } }, `${fmt.num(r.packedTotal - r.carryOut)} / ${fmt.num(r.shipmentBags)}`) },
+    { key: 'total', label: 'สะสม / ทั้งหมด (ตัน)', render: (r) => h('span', { style: { color: r.packedTotal - r.carryOut > r.shipmentBags ? 'var(--red)' : null } }, `${fmt.num((r.packedTotal - r.carryOut) * (r.mtPerBag || 0), 2)} / ${fmt.num(r.shipmentBags * (r.mtPerBag || 0), 2)}`) },
     { key: 'note', label: 'หมายเหตุ', type: 'text', editable: true, width: '160px' },
   ];
   const grid = dataGrid({
@@ -9662,8 +9776,8 @@ async function render(root, { rerender, kkMeta }) {
     rowClass: (r) => (r.status === 'short' ? 'row-yellow' : r.status === 'over' ? 'row-red' : r.status === 'match' ? 'row-green' : ''),
     onChange: async (r, key, value) => {
       const body = { shipmentId: r.shipmentId, lineCode: r.lineCode, date: r.date };
-      if (key === 'plannedBags') body.plannedBags = value ?? 0;
-      if (key === 'actualBags') body.actualBags = value;
+      if (key === 'plannedMt') body.plannedMt = value ?? 0;
+      if (key === 'actualMt') body.actualMt = value;
       if (key === 'note') body.note = value;
       const res = await put(body);
       if (!res) throw new Error('');
@@ -9684,17 +9798,17 @@ async function render(root, { rerender, kkMeta }) {
   const ships = await api.get(`/kk/packing?site=${encodeURIComponent(site.code)}&from=${state.from}&days=1&showAll=true`);
   const shipSel = selectEl(ships.rows.map((r) => ({ value: r.id, label: `${r.code} · ${r.product} (${r.line || '-'})` })), ships.rows[0]?.id, { style: { minWidth: '280px' } });
   const dateInp = h('input.inp', { type: 'date', value: single ? state.from : state.to });
-  const planInp = h('input.inp', { type: 'number', min: 0, step: 1, placeholder: 'แผน', style: { width: '100px' } });
-  const actInp = h('input.inp', { type: 'number', min: 0, step: 1, placeholder: 'จริง', style: { width: '100px' } });
+  const planInp = h('input.inp', { type: 'number', min: 0, step: '0.01', placeholder: 'ตัน', style: { width: '110px' } });
+  const actInp = h('input.inp', { type: 'number', min: 0, step: '0.01', placeholder: 'ตัน', style: { width: '110px' } });
   const add = async (e) => {
     e.preventDefault();
     const row = ships.rows.find((r) => r.id === shipSel.value);
     if (!row) return;
     if (!dateInp.value) { toast('เลือกวันที่บรรจุ', 'warn'); return; }
     const body = { shipmentId: row.id, lineCode: row.line, date: dateInp.value };
-    if (planInp.value !== '') body.plannedBags = Number(planInp.value);
-    if (actInp.value !== '') body.actualBags = Number(actInp.value);
-    if (body.plannedBags == null && body.actualBags == null) { toast('กรอกจำนวนถุงแผนหรือจริง', 'warn'); return; }
+    if (planInp.value !== '') body.plannedMt = Number(planInp.value);
+    if (actInp.value !== '') body.actualMt = Number(actInp.value);
+    if (body.plannedMt == null && body.actualMt == null) { toast('กรอกตันตามแผนหรือตันจริง', 'warn'); return; }
     const res = await put(body);
     if (res) { showCarry(res.carry); rerender(); }
   };
@@ -9702,7 +9816,7 @@ async function render(root, { rerender, kkMeta }) {
   root.append(h('div.card',
     h('div.card-head', h('h2', `บันทึกบรรจุจริง: แผน vs จริง (${b.rows.length} รายการ)`), h('span.hint', 'แก้ช่อง "บรรจุจริง" ได้เลยถ้ากรอกผิด · แถวเหลือง = บรรจุขาด · แถวแดง = บรรจุเกินแผนของวันนั้น')),
     grid,
-    ships.rows.length ? h('form.addrow', { onsubmit: add }, field('วันที่บรรจุ', dateInp), field('Shipment', shipSel), field('ถุงตามแผน', planInp), field('ถุงบรรจุจริง', actInp), h('button.btn.primary', { type: 'submit' }, '+ เพิ่มรายการบรรจุ')) : null));
+    ships.rows.length ? h('form.addrow', { onsubmit: add }, field('วันที่บรรจุ', dateInp), field('Shipment', shipSel), field('ตันตามแผน', planInp), field('ตันบรรจุจริง', actInp), h('button.btn.primary', { type: 'submit' }, '+ เพิ่มรายการบรรจุ')) : null));
 
   root.append(transferCard(transfers, site, rerender));
 }
@@ -9717,11 +9831,11 @@ function transferCard(list, site, rerender) {
         onclick: async () => { const r = await api.post('/kk/packing/rebalance', { siteCode: site.code }); showCarry(r.carry); if (!r.carry.length) toast('ยอดยกถูกต้องแล้ว', 'success', 1500); rerender(); },
       }, '↻ คำนวณยกยอดใหม่')),
     list.length ? h('div.grid-wrap', h('table.grid',
-      h('thead', h('tr', ['วันที่', 'รหัสสินค้า', 'จาก Shipment', '', 'ไป Shipment', 'ถุง'].map((t) => h('th', t)))),
+      h('thead', h('tr', ['วันที่', 'รหัสสินค้า', 'จาก Shipment', '', 'ไป Shipment', 'ตัน', 'ถุง'].map((t) => h('th', t)))),
       h('tbody', list.map((t) => h('tr',
         h('td.ro', fmt.date(t.date)), h('td.ro', h('b', t.product || '-')),
         h('td.ro.mono', t.fromCode), h('td.ro', '→'), h('td.ro.mono', t.toCode),
-        h('td.ro.num', h('b', fmt.num(t.bags)))))))) : h('div.empty', 'ยังไม่มีการยกยอด'));
+        h('td.ro.num', h('b', fmt.num(t.mt, 2))), h('td.ro.num', fmt.num(t.bags))))))) : h('div.empty', 'ยังไม่มีการยกยอด'));
 }
 
 async function doRollover(site, rerender) {
