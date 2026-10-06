@@ -449,7 +449,7 @@ const ROUTES = {
   'kk-plan': { view: kkPlan, title: 'แผนส่งออก — Export Shipment Plan' },
   'kk-daily': { view: kkDaily, title: 'สรุปรายวัน — สินค้าอะไร ต้องเข้าตู้กี่ตู้' },
   'kk-packing': { view: kkPacking, title: 'แผนบรรจุถุง (Packing Plan)' },
-  'kk-packdaily': { view: kkPackDaily, title: 'บันทึกบรรจุจริงประจำวัน — แผน vs จริง' },
+  'kk-packdaily': { view: kkPackDaily, title: 'บันทึกบรรจุจริง — แผน vs จริง (วันเดียว / ช่วงวันที่)' },
   'kk-packreport': { view: kkPackReport, title: 'สรุปบรรจุตามช่วงวันที่ — บรรจุไปแล้วเท่าไร' },
   'kk-settings': { view: kkSettings, title: 'ตั้งค่า, ข้อจำกัด & นำเข้าไฟล์' },
   'kk-loading': { view: kkLoading, title: 'งานโหลดตู้ — กรอกเบอร์ตู้ / ซีล' },
@@ -1242,12 +1242,13 @@ const COLLECTIONS = [
   // ---- บรรจุถุง (Bagging) ----
   'packingLines',   // สายบรรจุ + กำลังบรรจุ (ถุง/วัน)
   'packingRecords', // แผน/ยอดจริงการบรรจุ: Shipment × วันที่ × สาย
+  'packTransfers',  // ยกยอดถุงที่บรรจุเกินไป Shipment ถัดไป (สินค้าเดียวกัน)
 ];
 
 const PREFIX = {
   containerTypes: 'CT', products: 'PRD', capacityRules: 'CAP', orders: 'ORD',
   containers: 'CNT', loadItems: 'LI', actuals: 'ACT',
-  sites: 'SITE', shipments: 'SHP', shipmentPlans: 'PLN', containerUnits: 'CU', packMaterials: 'PK', packingLines: 'PL', packingRecords: 'PR',
+  sites: 'SITE', shipments: 'SHP', shipmentPlans: 'PLN', containerUnits: 'CU', packMaterials: 'PK', packingLines: 'PL', packingRecords: 'PR', packTransfers: 'PT',
 };
 
 const cleanStart = () => typeof process !== 'undefined' && process.env?.CLEAN_START === '1';
@@ -1292,7 +1293,7 @@ class Store {
   /** ลบข้อมูลงาน (Shipment, แผน, บรรจุ, คำสั่งซื้อ/SKU) — เก็บหน้างาน สายบรรจุ Bag/Pallet และประเภทตู้ไว้ */
   clearWork() {
     const removed = {};
-    for (const col of ['shipments', 'shipmentPlans', 'containerUnits', 'packingRecords', 'orders', 'containers', 'loadItems', 'actuals', 'products', 'capacityRules']) {
+    for (const col of ['shipments', 'shipmentPlans', 'containerUnits', 'packingRecords', 'packTransfers', 'orders', 'containers', 'loadItems', 'actuals', 'products', 'capacityRules']) {
       removed[col] = (this.data[col] ?? []).length;
       this.data[col] = [];
     }
@@ -3171,7 +3172,7 @@ const { parseExportPlan, applyImport } = __require("backend/services/kk/importer
 const { planGrid, planCsv, unitsCsv, shipmentDetail, dailySummary, dashboard } = __require("backend/services/kk/views.js");
 const { XLSX_MIME } = __require("backend/lib/xlsxWrite.js");
 const {
-  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport,
+  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, transfersOf, packDailyRange, carryIn, carryOut,
 } = __require("backend/services/kk/packing.js");
 
 const kkRouter = Router();
@@ -3346,7 +3347,7 @@ kkRouter.patch('/shipments/:id', (req, res) => {
     data.lines = [{ product: data.product ?? s.product, mt: data.mt ?? s.mt, bags: data.bags ?? s.bags, bagType: data.bagType ?? s.bagType, palletType: data.palletType ?? s.palletType }];
   }
   const days = store.find('shipmentPlans', (p) => p.shipmentId === s.id).map((p) => ({ siteCode: s.siteCode, date: p.date }));
-  const { issues } = kkGuarded(() => { store.update('shipments', s.id, data); syncUnits(s.id); }, {
+  const { issues } = kkGuarded(() => { store.update('shipments', s.id, data); syncUnits(s.id); if (data.packOpening !== undefined || data.bags !== undefined || data.product !== undefined || data.status !== undefined) rebalanceCarry(s.id); }, {
     force: isForce(req), scope: { shipmentIds: [s.id], days },
   });
   res.json({ ...shipmentDetail(s.id), issues });
@@ -3365,7 +3366,10 @@ function removeShipment(id) {
   store.removeWhere('shipmentPlans', (p) => p.shipmentId === id);
   store.removeWhere('containerUnits', (u) => u.shipmentId === id);
   store.removeWhere('packingRecords', (r) => r.shipmentId === id);
+  const others = store.find('packTransfers', (t) => t.fromId === id || t.toId === id).map((t) => (t.fromId === id ? t.toId : t.fromId));
+  store.removeWhere('packTransfers', (t) => t.fromId === id || t.toId === id);
   store.remove('shipments', id);
+  for (const o of others) rebalanceCarry(o);
 }
 
 // ลบหลาย Shipment พร้อมกัน (เช่น ข้อมูลนำเข้าไม่ครบ)
@@ -3382,13 +3386,15 @@ kkRouter.get('/packing/shipment/:id', (req, res) => {
   const s = store.get('shipments', req.params.id);
   if (!s) throw notFound('Shipment');
   const recs = store.find('packingRecords', (r) => r.shipmentId === s.id).sort((a, b) => a.date.localeCompare(b.date) || a.lineCode.localeCompare(b.lineCode));
-  res.json({ shipment: s, records: recs, lines: linesOf(s.siteCode) });
+  res.json({ shipment: s, records: recs, lines: linesOf(s.siteCode), carryIn: carryIn(s.id), carryOut: carryOut(s.id),
+    transfers: store.find('packTransfers', (t) => t.fromId === s.id || t.toId === s.id) });
 });
 kkRouter.delete('/packing/records/:id', (req, res) => {
   const r = store.get('packingRecords', req.params.id);
   if (!r) throw notFound('รายการบรรจุ');
-  store.transaction(() => store.remove('packingRecords', r.id));
-  res.status(204).end();
+  let carry = [];
+  store.transaction(() => { store.remove('packingRecords', r.id); carry = rebalanceCarry(r.shipmentId); });
+  res.json({ ok: true, carry });
 });
 // ลบแผนบรรจุของ Shipment: ค่าเริ่มต้นลบเฉพาะแผนที่ยังไม่มียอดจริง · all=true ลบทั้งหมดรวมยอดจริง
 kkRouter.delete('/packing/shipment/:id', (req, res) => {
@@ -3396,8 +3402,9 @@ kkRouter.delete('/packing/shipment/:id', (req, res) => {
   if (!s) throw notFound('Shipment');
   const all = req.query.all === 'true';
   let removed = 0;
-  store.transaction(() => { removed = store.removeWhere('packingRecords', (r) => r.shipmentId === s.id && (all || r.actualBags == null)); });
-  res.json({ removed });
+  let carry = [];
+  store.transaction(() => { removed = store.removeWhere('packingRecords', (r) => r.shipmentId === s.id && (all || r.actualBags == null)); carry = rebalanceCarry(s.id); });
+  res.json({ removed, carry });
 });
 
 // ---------- daily loading board ----------
@@ -3502,7 +3509,18 @@ kkRouter.delete('/packing-lines/:id', (req, res) => {
 kkRouter.get('/packing', (req, res) => {
   res.json(packGrid({ siteCode: req.query.site || 'KK', from: req.query.from, days: Number(req.query.days || 21), q: req.query.q || '', showAll: req.query.showAll === 'true' }));
 });
-kkRouter.get('/packing/daily', (req, res) => res.json(packDaily(req.query.site || 'KK', req.query.date || todayISO())));
+kkRouter.get('/packing/daily', (req, res) => {
+  if (req.query.from && req.query.to) return res.json(packDailyRange(req.query.site || 'KK', req.query.from, req.query.to));
+  return res.json(packDaily(req.query.site || 'KK', req.query.date || todayISO()));
+});
+kkRouter.get('/packing/transfers', (req, res) => res.json(transfersOf(req.query.site || 'KK')));
+// ถอน/ยกเลิกการยกยอด (เช่น ไม่ต้องการให้ยกอัตโนมัติ) แล้วคำนวณใหม่
+kkRouter.post('/packing/rebalance', (req, res) => {
+  const ids = store.find('shipments', (s) => s.siteCode === (req.body.siteCode || 'KK')).map((s) => s.id);
+  let carry = [];
+  store.transaction(() => { for (const id of ids) carry.push(...rebalanceCarry(id)); });
+  res.json({ carry });
+});
 kkRouter.put('/packing/records', (req, res) => {
   res.json(setPackingRecord(req.body, { force: isForce(req) }));
 });
@@ -4301,6 +4319,11 @@ Object.defineProperty(__exports, "needsPacking", { enumerable: true, get: () => 
 Object.defineProperty(__exports, "effBags", { enumerable: true, get: () => effBags });
 Object.defineProperty(__exports, "mtPerBag", { enumerable: true, get: () => mtPerBag });
 Object.defineProperty(__exports, "packDayTotals", { enumerable: true, get: () => packDayTotals });
+Object.defineProperty(__exports, "carryIn", { enumerable: true, get: () => carryIn });
+Object.defineProperty(__exports, "carryOut", { enumerable: true, get: () => carryOut });
+Object.defineProperty(__exports, "openingOf", { enumerable: true, get: () => openingOf });
+Object.defineProperty(__exports, "rebalanceCarry", { enumerable: true, get: () => rebalanceCarry });
+Object.defineProperty(__exports, "transfersOf", { enumerable: true, get: () => transfersOf });
 Object.defineProperty(__exports, "lineUsage", { enumerable: true, get: () => lineUsage });
 Object.defineProperty(__exports, "lineLevel", { enumerable: true, get: () => lineLevel });
 Object.defineProperty(__exports, "readiness", { enumerable: true, get: () => readiness });
@@ -4320,6 +4343,7 @@ Object.defineProperty(__exports, "packForecast", { enumerable: true, get: () => 
 Object.defineProperty(__exports, "XLSX_HEADER", { enumerable: true, get: () => XLSX_HEADER });
 Object.defineProperty(__exports, "packingWorkbook", { enumerable: true, get: () => packingWorkbook });
 Object.defineProperty(__exports, "packingReport", { enumerable: true, get: () => packingReport });
+Object.defineProperty(__exports, "packDailyRange", { enumerable: true, get: () => packDailyRange });
 /**
  * บรรจุถุง (Bagging) — แผนบรรจุรายวัน + ความพร้อมก่อนโหลดตู้
  * --------------------------------------------------------------
@@ -4377,6 +4401,76 @@ function packDayTotals(siteCode, date) {
   return t;
 }
 const recordsOf = (shipmentId) => store.find('packingRecords', (r) => r.shipmentId === shipmentId);
+
+// ---------------- ยกยอดถุงที่บรรจุเกิน → Shipment ถัดไป (สินค้าเดียวกัน) ----------------
+const carryIn = (id) => store.find('packTransfers', (t) => t.toId === id).reduce((a, t) => a + t.bags, 0);
+const carryOut = (id) => store.find('packTransfers', (t) => t.fromId === id).reduce((a, t) => a + t.bags, 0);
+/** ถุงยกมาสุทธิ = ยกมาตั้งต้น + รับยกยอดเข้า − ยกยอดออก */
+const openingOf = (s) => Number(s.packOpening || 0) + carryIn(s.id) - carryOut(s.id);
+// รหัสสินค้าต้องตรงกันทุกตัวอักษร เช่น 1QLL2060MM07N1200 ≠ 1QLL2060MM07N1000 · Shipment หลายสินค้า (A + B) ไม่ยกยอด
+const prodKey = (s) => {
+  const p = String(s.product || '').trim().replace(/\s+/g, ' ').toUpperCase();
+  return !p || p === '-' || p.includes(' + ') ? '' : p;
+};
+/** ถุงที่บรรจุจริงแล้วทั้งหมดของ Shipment (ไม่รวมแผน) ก่อนหักยกยอดออก */
+function packedRaw(s) {
+  const per = bagsPerCont(s);
+  const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * per);
+  return Number(s.packOpening || 0) + assumed + carryIn(s.id) + recordsOf(s.id).reduce((a, r) => a + (r.actualBags ?? 0), 0);
+}
+/** Shipment ถัดไปที่รับยกยอดได้: หน้างาน + สินค้าเดียวกัน ยังเปิดอยู่ เรียงตามวันโหลดถัดไป */
+function carryTargets(s, today = todayISO()) {
+  const key = prodKey(s);
+  if (!key) return [];
+  const nextLoad = (x) => store.find('shipmentPlans', (p) => p.shipmentId === x.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort()[0] ?? null;
+  return store.find('shipments', (x) => x.id !== s.id && x.siteCode === s.siteCode && x.status === 'open' && prodKey(x) === key && Number(x.bags) > 0)
+    .map((x) => ({ x, nl: nextLoad(x), room: Math.max(0, Number(x.bags) - packedRaw(x) + carryOut(x.id)) }))
+    .filter((o) => o.nl || !store.findOne('shipmentPlans', (p) => p.shipmentId === o.x.id && p.conts > 0)) // ยังมีงานต้องโหลด
+    .sort((a, b) => (a.nl ?? '9999').localeCompare(b.nl ?? '9999') || (a.x.closingDate ?? a.x.etd ?? '9999').localeCompare(b.x.closingDate ?? b.x.etd ?? '9999') || a.x.code.localeCompare(b.x.code));
+}
+/**
+ * ปรับยอดยกออกของ Shipment ให้ตรงกับถุงที่บรรจุเกินจริง (เรียกทุกครั้งที่ยอดบรรจุจริงเปลี่ยน)
+ * เกิน → ยกไป Shipment ถัดไปของสินค้าเดียวกัน (ต่อเนื่องถ้าตัวถัดไปเกินอีก) · ลดลง (แก้ยอดผิด) → ดึงยอดที่ยกไปกลับคืน
+ */
+function rebalanceCarry(shipmentId, depth = 0, moves = []) {
+  const s = store.get('shipments', shipmentId);
+  if (!s || depth > 20) return moves;
+  const want = Math.max(0, packedRaw(s) - Number(s.bags || 0));
+  let cur = carryOut(s.id);
+  const touched = new Set();
+  if (want > cur) {
+    let delta = want - cur;
+    const targets = carryTargets(s);
+    for (const t of targets) {
+      if (delta <= 0) break;
+      const n = Math.min(delta, t.room); // ยกไปได้ไม่เกินถุงที่ Shipment ปลายทางยังต้องใช้
+      if (n <= 0) continue;
+      const ex = store.findOne('packTransfers', (x) => x.fromId === s.id && x.toId === t.x.id);
+      if (ex) store.update('packTransfers', ex.id, { bags: ex.bags + n, date: todayISO() });
+      else store.insert('packTransfers', { fromId: s.id, toId: t.x.id, fromCode: s.code, toCode: t.x.code, product: s.product, bags: n, date: todayISO(), auto: true });
+      moves.push({ type: 'out', from: s.code, to: t.x.code, bags: n, product: s.product });
+      touched.add(t.x.id);
+      delta -= n;
+    }
+    if (delta > 0) moves.push({ type: 'nowhere', from: s.code, bags: delta, product: s.product });
+  } else if (want < cur) {
+    let back = cur - want;
+    for (const t of store.find('packTransfers', (x) => x.fromId === s.id).sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id))) {
+      if (back <= 0) break;
+      const n = Math.min(back, t.bags);
+      if (n === t.bags) store.remove('packTransfers', t.id); else store.update('packTransfers', t.id, { bags: t.bags - n });
+      moves.push({ type: 'back', from: t.toCode, to: s.code, bags: n, product: s.product });
+      touched.add(t.toId);
+      back -= n;
+    }
+  }
+  for (const id of touched) rebalanceCarry(id, depth + 1, moves);
+  return moves;
+}
+function transfersOf(siteCode) {
+  const ids = new Set(store.find('shipments', (x) => x.siteCode === siteCode).map((x) => x.id));
+  return store.find('packTransfers', (t) => ids.has(t.fromId) || ids.has(t.toId)).sort((a, b) => b.date.localeCompare(a.date));
+}
 const findRecord = (shipmentId, date, lineCode) =>
   store.findOne('packingRecords', (r) => r.shipmentId === shipmentId && r.date === date && r.lineCode === lineCode);
 
@@ -4399,7 +4493,7 @@ function readiness(s, today = todayISO()) {
   const lead = Number(site?.packLeadDays ?? 0);
   const units = unitsOf(s.id);
   const assumedBags = Math.round(units.filter((u) => u.assumed && u.status === 'loaded').length * per);
-  const opening = Number(s.packOpening || 0);
+  const opening = openingOf(s);
   const recs = recordsOf(s.id);
   const supplyBy = (d) => opening + assumedBags + recs.filter((r) => r.date <= d).reduce((a, r) => a + effBags(r), 0);
   const demandUnits = units.filter((u) => !u.assumed && u.planDate);
@@ -4424,7 +4518,9 @@ function readiness(s, today = todayISO()) {
     lead, per: round(per, 2), opening, assumedBags, packedActual, plannedOrPacked,
     covered, remainingToPlan: Math.max(0, Math.round(s.bags - covered)), overPlanned: Math.max(0, Math.round(covered - s.bags)),
     checks, firstShort,
-    status: firstShort ? 'short' : covered >= s.bags ? 'covered' : 'ok',
+    packedDone: opening + assumedBags + packedActual,
+    // covered = บรรจุจริงครบทุกถุงแล้ว · planned = ลงแผนบรรจุครบแล้วแต่ยังบรรจุจริงไม่ครบ
+    status: firstShort ? 'short' : opening + assumedBags + packedActual >= s.bags ? 'covered' : covered >= s.bags ? 'planned' : 'ok',
   };
 }
 
@@ -4527,10 +4623,13 @@ function setPackingRecord({ shipmentId, date, lineCode, plannedBags, actualBags,
   if (p !== undefined) patch.plannedBags = p ?? 0;
   if (a !== undefined) patch.actualBags = a;
   if (note !== undefined) patch.note = String(note ?? '');
-  const { issues } = packGuarded(() => upsertRecord(s.id, date, line.code, patch), {
+  const existing = findRecord(s.id, date, line.code);
+  if (existing?.rolledOver && a !== undefined && a != null) patch.plannedBags = a; // แก้ยอดจริงหลังปัดยอดแล้ว — แผนวันนั้น = ยอดจริงใหม่
+  let moves = [];
+  const { issues } = packGuarded(() => { upsertRecord(s.id, date, line.code, patch); moves = rebalanceCarry(s.id); }, {
     force, scope: { shipmentIds: [s.id], lineDays: [{ lineCode: line.code, date }] },
   });
-  return { record: findRecord(s.id, date, line.code), issues };
+  return { record: findRecord(s.id, date, line.code), issues, carry: moves };
 }
 
 // ---------------- views ----------------
@@ -4580,8 +4679,10 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
     }
     rows.push({
       id: s.id, code: s.code, customerName: s.customerName, product: s.product, bagType: s.bagType, bags: s.bags, conts: s.conts, mt: s.mt, mtPerBag: round(mtPerBag(s), 4),
-      closingDate: s.closingDate, closingTime: s.closingTime, packOpening: s.packOpening || 0,
+      closingDate: s.closingDate, closingTime: s.closingTime, packOpening: s.packOpening || 0, carryIn: carryIn(s.id), carryOut: carryOut(s.id),
       line: line?.code ?? null, readiness: r, cells, issues,
+      packFirst: recs.filter((x) => (x.plannedBags || x.actualBags)).map((x) => x.date).sort()[0] ?? null,
+      packLast: recs.filter((x) => (x.plannedBags || x.actualBags)).map((x) => x.date).sort().at(-1) ?? null,
       firstLoad: r.checks[0]?.date ?? null,
       worst: issues.some((i) => i.severity === 'error') ? 'red' : issues.length ? 'yellow' : 'green',
     });
@@ -4627,6 +4728,7 @@ function packDaily(siteCode, date) {
       const plannedMt = mtOf(s, planned) ?? 0;
       const actualMt = mtOf(s, rec.actualBags);
       rows.push({
+        date, carryIn: carryIn(s.id), carryOut: carryOut(s.id), shipmentBags: s.bags, packedTotal: packedRaw(s),
         mtPerBag: round(mtPerBag(s), 4), plannedMt, actualMt, varianceMt: actualMt == null ? null : round(plannedMt - actualMt, 2),
         recordId: rec.id, shipmentId: s.id, code: s.code, customerName: s.customerName, product: s.product, bagType: s.bagType,
         lineCode: rec.lineCode, plannedBags: planned, actualBags: rec.actualBags, variance, note: rec.note || '',
@@ -4855,6 +4957,7 @@ function parsePackingFile(buf) {
 
 function applyPackingImport(parsed) {
   const report = { created: 0, updated: 0, rows: parsed.items.length, errors: [...parsed.errors], warnings: [], lineDays: [] };
+  const touchedShips = new Set();
   for (const it of parsed.items) {
     let cands = store.find('shipments', (s) => s.code.toUpperCase() === it.code.toUpperCase() && s.status !== 'cancelled');
     if (it.site) cands = cands.filter((s) => s.siteCode === it.site);
@@ -4875,9 +4978,12 @@ function applyPackingImport(parsed) {
     if (it.actual !== undefined) patch.actualBags = it.actual;
     if (it.note !== undefined) patch.note = it.note;
     upsertRecord(s.id, it.date, line.code, patch);
+    if (it.actual !== undefined) touchedShips.add(s.id);
     if (existed) report.updated++; else report.created++;
     report.lineDays.push({ lineCode: line.code, date: it.date });
   }
+  report.carry = [];
+  for (const id of touchedShips) report.carry.push(...rebalanceCarry(id));
   const seen = new Set();
   report.issues = [];
   for (const ld of report.lineDays) {
@@ -4955,7 +5061,7 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
     const units = unitsOf(s.id);
     const assumedBags = Math.round(units.filter((u) => u.assumed && u.status === 'loaded').length * per);
     const recs = recordsOf(s.id);
-    const have = Number(s.packOpening || 0) + assumedBags + recs.filter((r) => r.date < today).reduce((a, r) => a + effBags(r), 0);
+    const have = openingOf(s) + assumedBags + recs.filter((r) => r.date < today).reduce((a, r) => a + effBags(r), 0);
     const todayActual = recs.filter((r) => r.date === today).reduce((a, r) => a + (r.actualBags ?? 0), 0);
     const demandUnits = units.filter((u) => !u.assumed && u.planDate);
     const bagsOfUnit = (u) => (u.status === 'loaded' && u.actualBags != null ? u.actualBags : per);
@@ -5271,7 +5377,7 @@ function packingReport({ siteCode = 'KK', from, to, product = '', shipment = '' 
       const per = bagsPerCont(s);
       const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * per);
       const shipped = Math.round(store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.date < today).reduce((a, p) => a + p.conts, 0) * per);
-      const packedAll = Math.min(s.bags || Infinity, Math.max(Number(s.packOpening || 0) + assumed + all.reduce((a, r) => a + (r.actualBags ?? 0), 0), shipped));
+      const packedAll = Math.min(s.bags || Infinity, Math.max(openingOf(s) + assumed + all.reduce((a, r) => a + (r.actualBags ?? 0), 0), shipped));
       byShip.set(s.id, { shipmentId: s.id, code: s.code, customerName: s.customerName, product: prodOf(s), bags: s.bags, mt: s.mt, mtPerBag: round(mtPerBag(s), 4), packedAllBags: packedAll, packedAllMt: round(packedAll * mtPerBag(s), 2), firstDate: null, lastDate: null, loadFirst: null, loadLast: null, ...z() });
     }
     return byShip.get(s.id);
@@ -5319,6 +5425,32 @@ function packingReport({ siteCode = 'KK', from, to, product = '', shipment = '' 
     byProduct: [...byProduct.values()].map(({ ships: sh, ...o }) => ({ ...fin(o), shipments: sh.size, progress: progressOf(shipRows.filter((r) => r.product === o.product)) })).sort((a, b) => b.plannedMt - a.plannedMt || b.contsMt - a.contsMt),
     byShipment: shipRows,
     byDate: dates.map((d) => ({ date: d, past: d < today, ...fin(byDate.get(d)) })),
+  };
+}
+
+/** บันทึกบรรจุจริงแบบช่วงวันที่ (เช่น 1–31 ต.ค.) — รวมทุกวันในช่วง */
+function packDailyRange(siteCode, from, to) {
+  const site = siteOf(siteCode);
+  if (!site) throw notFound(`หน้างาน ${siteCode}`);
+  if (!isISODate(from) || !isISODate(to) || to < from) throw badRequest('ช่วงวันที่ไม่ถูกต้อง');
+  const n = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000) + 1;
+  if (n > 62) throw badRequest('เลือกช่วงได้ไม่เกิน 62 วัน');
+  if (n === 1) return { ...packDaily(site.code, from), from, to, range: false };
+  const days = dateRange(from, n).map((d) => packDaily(site.code, d));
+  const rows = days.flatMap((d) => d.rows.filter((r) => r.recordId)); // ช่วงหลายวัน: แสดงเฉพาะรายการที่มีแผน/ยอดบรรจุ
+  const sum = (k) => rows.reduce((a, r) => a + (r[k] ?? 0), 0);
+  return {
+    site, from, to, range: true, lead: Number(site.packLeadDays ?? 0), lines: [], rows,
+    summary: {
+      planned: sum('plannedBags'), actual: sum('actualBags'),
+      plannedMt: round(sum('plannedMt'), 2), actualMt: round(sum('actualMt'), 2),
+      entered: rows.filter((r) => r.actualBags != null).length,
+      pending: rows.filter((r) => r.status === 'pending' && r.plannedBags > 0 && r.date < todayISO()).length,
+      short: rows.filter((r) => r.status === 'short').length, over: rows.filter((r) => r.status === 'over').length,
+      canRollover: 0,
+    },
+    issues: [],
+    transfers: transfersOf(site.code).filter((t) => t.date >= from && t.date <= to),
   };
 }
 
@@ -8985,10 +9117,11 @@ const { h, fmt, addDays, badge, renderIssues, modal, toast, field, withValidatio
 const { siteSelect, currentSite, openShipmentModal } = __require("js/kkshared.js");
 const { kkState } = __require("js/kkshared.js");
 const { riskBadge } = __require("js/views/kkdash.js");
+const { showCarry } = __require("js/views/kkpackdaily.js");
 
 const state = { from: null, days: 14, q: '', alertsOpen: false };
 const WD = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส'];
-const READY = { short: ['ถุงไม่พอ', 'red'], ok: ['พร้อมตามแผนโหลด', 'green'], covered: ['บรรจุครบแล้ว', 'green'], no_bags: ['ไม่มีถุง', 'gray'] };
+const READY = { short: ['ถุงไม่พอ', 'red'], ok: ['พร้อมตามแผนโหลด', 'green'], planned: ['ลงแผนบรรจุครบ', 'blue'], covered: ['บรรจุจริงครบแล้ว', 'green'], no_bags: ['ไม่มีถุง', 'gray'] };
 
 /** แม่แบบ Excel: มีคอลัมน์ Loading date, ตัน/ถุง, ตัน (สูตร) + ชีตสรุปรายวัน + คาดการณ์ */
 function downloadTemplate() {
@@ -9154,7 +9287,7 @@ async function openLineDay(l, date, lines, site, rerender) {
 function mainTable(g, site, rerender) {
   const lineOpts = g.lines.map((l) => ({ value: l.code, label: l.code }));
   const head = h('tr',
-    h('th.sticky-col', 'Shipment'), h('th', 'สินค้า / Bag'), h('th', 'Loading ถัดไป'), h('th', 'สาย'), h('th.num', 'ถุงทั้งหมด'), h('th.num', 'ถุงยกมา'), h('th', 'บรรจุ/แผน'),
+    h('th.sticky-col', 'Shipment'), h('th', 'สินค้า / Bag'), h('th', 'Loading ถัดไป'), h('th', 'สาย'), h('th.num', 'ถุงทั้งหมด'), h('th.num', 'ถุงยกมา'), h('th', 'บรรจุจริง / ลงแผน (ถุง)'),
     g.dates.map((d) => dayHead(d, g.today)));
   const totalRow = h('tr.total',
     h('td.sticky-col', h('b', 'รวมตัน/วัน'), h('div.sub', 'บรรจุจริง / แผน (ตัน)')),
@@ -9193,9 +9326,12 @@ function mainTable(g, site, rerender) {
     op.addEventListener('change', async () => {
       try { await api.patch(`/kk/shipments/${r.id}`, { packOpening: op.value === '' ? 0 : Number(op.value), force: true }); rerender(); } catch (err) { toast(err.message, 'error'); }
     });
-    tr.append(h('td.num', op));
+    tr.append(h('td.num', op,
+      r.carryIn ? h('div.sub', { style: { color: 'var(--green)' } }, `+${fmt.num(r.carryIn)} รับยก`) : null,
+      r.carryOut ? h('div.sub', { style: { color: 'var(--primary)' } }, `−${fmt.num(r.carryOut)} ยกออก`) : null));
     tr.append(h('td.nowrap', h('div', `${fmt.num(rd.packedActual)} / ${fmt.num(rd.plannedOrPacked)}`),
-      h('div.sub', rd.remainingToPlan ? `ยังไม่ลงแผน ${fmt.num(rd.remainingToPlan)}` : rd.overPlanned ? `เกิน ${fmt.num(rd.overPlanned)}` : 'ครบ')));
+      h('div.sub', rd.remainingToPlan ? `ยังไม่ลงแผน ${fmt.num(rd.remainingToPlan)}` : rd.overPlanned ? `แผนเกิน ${fmt.num(rd.overPlanned)}` : rd.packedDone >= r.bags ? 'บรรจุครบ' : 'ลงแผนครบ'),
+      r.packFirst ? h('div.sub', `แผนบรรจุ ${fmt.date(r.packFirst, { day: 'numeric', month: 'short' })}${r.packLast !== r.packFirst ? `–${fmt.date(r.packLast, { day: 'numeric', month: 'short' })}` : ''}`) : null));
 
     g.dates.forEach((d, ci) => {
       const c = r.cells[d.date];
@@ -9367,7 +9503,7 @@ async function openPackEdit(shipmentId, rerender) {
   let dirty = false;
   const save = async (payload) => {
     const r = await withValidation((force) => api.put('/kk/packing/records', { shipmentId, ...payload, force }));
-    if (r) { dirty = true; d = await api.get(`/kk/packing/shipment/${shipmentId}`); draw(); }
+    if (r) { showCarry(r.carry); dirty = true; d = await api.get(`/kk/packing/shipment/${shipmentId}`); draw(); }
     return r;
   };
   const draw = () => {
@@ -9383,12 +9519,14 @@ async function openPackEdit(shipmentId, rerender) {
         h('span', 'ถุงทั้งหมด ', h('b', fmt.num(s.bags)), ` (${fmt.num(s.mt, 1)} ตัน)`),
         h('span', 'ลงแผนแล้ว ', h('b', fmt.num(tp)), ` ถุง = ${fmt.num(tp * mpb, 1)} ตัน`),
         h('span', 'บรรจุจริง ', h('b', fmt.num(ta)), ` ถุง = ${fmt.num(ta * mpb, 1)} ตัน`),
-        h('span.muted', `${fmt.num(mpb, 3)} ตัน/ถุง`)),
+        h('span.muted', `${fmt.num(mpb, 3)} ตัน/ถุง`),
+        d.carryOut ? badge(`ยกออก ${fmt.num(d.carryOut)} ถุง → ${d.transfers.filter((t) => t.fromId === s.id).map((t) => t.toCode).join(', ')}`, 'blue') : null,
+        d.carryIn ? badge(`รับยกมา ${fmt.num(d.carryIn)} ถุง ← ${d.transfers.filter((t) => t.toId === s.id).map((t) => t.fromCode).join(', ')}`, 'green') : null),
       recs.length ? h('div.grid-wrap', { style: { maxHeight: '340px' } }, h('table.grid',
         h('thead', h('tr', ['วันที่บรรจุ', 'สาย', 'ถุงตามแผน', 'ถุงจริง', 'ตัน (แผน / จริง)', 'หมายเหตุ', ''].map((t) => h('th', t)))),
         h('tbody', recs.map((x) => {
           const p = h('input.cell', { type: 'number', min: 0, step: 1, value: x.plannedBags ?? 0, disabled: !!x.rolledOver });
-          const a = h('input.cell', { type: 'number', min: 0, step: 1, value: x.actualBags ?? '', placeholder: '–', disabled: !!x.rolledOver });
+          const a = h('input.cell', { type: 'number', min: 0, step: 1, value: x.actualBags ?? '', placeholder: '–' });
           const n = h('input.cell', { value: x.note || '' });
           p.onchange = () => save({ date: x.date, lineCode: x.lineCode, plannedBags: p.value === '' ? 0 : Number(p.value) });
           a.onchange = () => save({ date: x.date, lineCode: x.lineCode, actualBags: a.value === '' ? null : Number(a.value) });
@@ -9403,7 +9541,7 @@ async function openPackEdit(shipmentId, rerender) {
               type: 'button', title: 'ลบรายการนี้',
               onclick: async () => {
                 if (!(await confirmDialog('ลบรายการบรรจุ', `ลบรายการวันที่ ${fmt.date(x.date)} (${x.lineCode})?`, { okLabel: 'ลบ', okCls: 'danger' }))) return;
-                try { await api.del(`/kk/packing/records/${x.id}`); dirty = true; d = await api.get(`/kk/packing/shipment/${shipmentId}`); draw(); } catch (e) { toast(e.message, 'error'); }
+                try { const res = await api.del(`/kk/packing/records/${x.id}`); showCarry(res?.carry); dirty = true; d = await api.get(`/kk/packing/shipment/${shipmentId}`); draw(); } catch (e) { toast(e.message, 'error'); }
               },
             }, '🗑')));
         })))) : h('div.empty', 'ยังไม่มีแผนบรรจุ — เพิ่มรายการด้านล่าง'),
@@ -9431,117 +9569,165 @@ async function openPackEdit(shipmentId, rerender) {
 });
 __define("js/views/kkpackdaily.js", function (__exports, __require, __url) {
 'use strict';
+Object.defineProperty(__exports, "showCarry", { enumerable: true, get: () => showCarry });
 Object.defineProperty(__exports, "render", { enumerable: true, get: () => render });
-// บันทึกบรรจุจริงประจำวัน — แผน vs จริง ต่อ Shipment/สาย, ปัดยอดที่บรรจุขาดไปวันถัดไป
+// บันทึกบรรจุจริง — เลือกวันเดียวหรือช่วงวันที่ · แก้ยอดจริงที่กรอกผิดได้ · ถุงที่บรรจุเกิน Shipment ยกไป Shipment ถัดไป (สินค้าเดียวกัน) อัตโนมัติ
 const { api } = __require("js/api.js");
-const { h, fmt, addDays, badge, renderIssues, modal, toast, dataGrid, withValidation, confirmDialog, progressBar, selectEl, field } = __require("js/ui.js");
+const { h, fmt, addDays, badge, renderIssues, modal, toast, dataGrid, withValidation, confirmDialog, progressBar, selectEl, field, rangePicker, rangeText } = __require("js/ui.js");
 const { siteSelect, currentSite } = __require("js/kkshared.js");
 
-const state = { date: null };
+const state = { from: null, to: null };
 const STATUS = { pending: ['รอบันทึกจริง', 'gray'], match: ['ตรงตามแผน', 'green'], short: ['บรรจุขาด', 'yellow'], over: ['บรรจุเกิน', 'red'] };
+const d2 = (iso) => fmt.date(iso, { day: 'numeric', month: 'short' });
+
+/** แจ้งผลการยกยอดถุงอัตโนมัติ */
+function showCarry(carry) {
+  if (!carry?.length) return;
+  const msg = carry.map((m) => (m.type === 'out' ? `ยก ${fmt.num(m.bags)} ถุง ${m.from} → ${m.to}`
+    : m.type === 'back' ? `ดึงคืน ${fmt.num(m.bags)} ถุง ${m.from} → ${m.to}`
+      : `${m.from} บรรจุเกิน ${fmt.num(m.bags)} ถุง — ไม่มี Shipment ถัดไปที่รหัสสินค้า ${m.product || ''} ตรงกันให้รับยกยอด`)).join(' · ');
+  toast(`ยกยอดถุง (${carry[0].product || ''}): ${msg}`, carry.some((m) => m.type === 'nowhere') ? 'warn' : 'success', 7000);
+}
 
 async function render(root, { rerender, kkMeta }) {
   const site = currentSite(kkMeta.sites);
   if (!site) { root.append(h('div.card.empty', 'ยังไม่มีหน้างาน')); return; }
-  state.date ??= kkMeta.today;
-  const b = await api.get(`/kk/packing/daily?site=${encodeURIComponent(site.code)}&date=${state.date}`);
+  state.from ??= kkMeta.today;
+  state.to ??= kkMeta.today;
+  const single = state.from === state.to;
+  const b = await api.get(`/kk/packing/daily?site=${encodeURIComponent(site.code)}&from=${state.from}&to=${state.to}`);
+  const transfers = (await api.get(`/kk/packing/transfers?site=${encodeURIComponent(site.code)}`)).filter((t) => single || (t.date >= state.from && t.date <= state.to));
   const s = b.summary;
-  const go = (d) => { state.date = d; rerender(); };
-  const put = (body) => withValidation((force) => api.put('/kk/packing/records', { ...body, date: state.date, force }));
+  const go = (n) => { state.from = addDays(state.from, n); state.to = addDays(state.to, n); rerender(); };
+  const put = (body) => withValidation((force) => api.put('/kk/packing/records', { ...body, force }));
 
   root.append(h('div.toolbar',
     siteSelect(kkMeta.sites, rerender),
-    h('button.btn', { type: 'button', onclick: () => go(addDays(state.date, -1)) }, '◀'),
-    h('input.inp', { type: 'date', value: state.date, onchange: (e) => e.target.value && go(e.target.value) }),
-    h('button.btn', { type: 'button', onclick: () => go(addDays(state.date, 1)) }, '▶'),
-    h('button.btn', { type: 'button', onclick: () => go(kkMeta.today) }, 'วันนี้'),
-    h('strong', { style: { marginLeft: '6px' } }, fmt.dateLong(state.date)),
+    h('button.btn', { type: 'button', title: 'เลื่อนย้อนหลัง', onclick: () => go(single ? -1 : -7) }, '◀'),
+    h('button.btn', { type: 'button', onclick: () => { state.from = kkMeta.today; state.to = kkMeta.today; rerender(); } }, 'วันนี้'),
+    h('button.btn', { type: 'button', title: 'เลื่อนไปข้างหน้า', onclick: () => go(single ? 1 : 7) }, '▶'),
+    rangePicker({ from: state.from, to: state.to, today: kkMeta.today, max: 62, onChange: (f, t) => { state.from = f; state.to = t; rerender(); } }),
     h('div.spacer'),
-    s.pending ? h('button.btn', {
+    single && s.pending ? h('button.btn', {
       type: 'button',
       onclick: async () => {
         if (!(await confirmDialog('กรอกยอดจริง = แผน', `กรอกยอดบรรจุจริงเท่ากับแผนให้ ${s.pending} รายการที่ยังไม่ได้กรอก?`))) return;
+        const carry = [];
         for (const r of b.rows.filter((x) => x.status === 'pending' && x.plannedBags > 0)) {
-          await api.put('/kk/packing/records', { shipmentId: r.shipmentId, date: state.date, lineCode: r.lineCode, actualBags: r.plannedBags, force: true });
+          const res = await api.put('/kk/packing/records', { shipmentId: r.shipmentId, date: r.date, lineCode: r.lineCode, actualBags: r.plannedBags, force: true });
+          carry.push(...(res.carry || []));
         }
+        showCarry(carry);
         rerender();
       },
     }, `✓ กรอกจริง = แผน (${s.pending})`) : null,
-    h('button.btn.warn', { type: 'button', disabled: !s.canRollover, onclick: () => doRollover(site, rerender) }, `⤳ ปัดยอดขาดไปวันถัดไป (${s.canRollover})`)));
+    single ? h('button.btn.warn', { type: 'button', disabled: !s.canRollover, onclick: () => doRollover(site, rerender) }, `⤳ ปัดยอดขาดไปวันถัดไป (${s.canRollover})`) : null));
+
+  root.append(h('div.site-banner',
+    h('b', single ? fmt.dateLong(state.from) : rangeText(state.from, state.to)),
+    h('span.muted', single ? 'แก้ "บรรจุจริง" ได้ถ้ากรอกผิด' : 'ช่วงหลายวัน: แสดงเฉพาะรายการที่มีแผน/ยอดบรรจุ · แก้ยอดจริงย้อนหลังได้'),
+    h('span.muted', 'บรรจุเกินจำนวนถุงของ Shipment → ยกไป Shipment ถัดไปที่รหัสสินค้าตรงกันทุกตัวอัตโนมัติ')));
 
   root.append(h('div.card', h('div.card-body', { style: { display: 'grid', gap: '10px' } },
-    h('div.util-pair', b.lines.map((l) => progressBar({ label: `${l.code} ${l.name || ''}`, value: l.used, max: l.cap || l.used || 1, unit: 'ถุง', level: l.level, digits: 0 }))),
+    b.lines?.length ? h('div.util-pair', b.lines.map((l) => progressBar({ label: `${l.code} ${l.name || ''}`, value: l.used, max: l.cap || l.used || 1, unit: 'ถุง', level: l.level, digits: 0 }))) : null,
     h('div.stat-row',
       h('span', 'แผน ', h('b', fmt.num(s.planned)), ' ถุง = ', h('b', fmt.num(s.plannedMt, 2)), ' ตัน'),
       h('span', 'บรรจุได้จริง ', h('b', fmt.num(s.actual)), ' ถุง = ', h('b', { style: { color: s.entered && s.actualMt < s.plannedMt ? 'var(--yellow)' : 'var(--green)' } }, fmt.num(s.actualMt, 2)), ' ตัน'),
-      s.entered ? h('span', 'ส่วนต่าง ', h('b', fmt.signed(Math.round((s.plannedMt - s.actualMt) * 100) / 100, 2)), ' ตัน') : null,
       h('span', 'บันทึกแล้ว ', h('b', s.entered), ` / ${b.rows.length} รายการ`),
       s.short ? h('span', badge(`ขาด ${s.short}`, 'yellow')) : null, s.over ? h('span', badge(`เกิน ${s.over}`, 'red')) : null,
-      h('span.muted', b.lead ? `ถุงต้องเสร็จก่อนวันโหลด ${b.lead} วัน` : 'บรรจุเสร็จภายในวันโหลดได้')),
-    renderIssues(b.issues))));
+      single ? h('span.muted', b.lead ? `ถุงต้องเสร็จก่อนวันโหลด ${b.lead} วัน` : 'บรรจุเสร็จภายในวันโหลดได้') : null),
+    b.issues?.length ? renderIssues(b.issues) : null)));
 
+  const columns = [
+    ...(single ? [] : [{ key: 'date', label: 'วันที่บรรจุ', render: (r) => h('b', `${fmt.date(r.date, { weekday: 'short', day: 'numeric', month: 'short' })}`) }]),
+    { key: 'lineCode', label: 'สาย', render: (r) => h('b', r.lineCode) },
+    { key: 'code', label: 'Shipment', render: (r) => h('span', h('span.mono', r.code), h('div.sub', r.customerName || ''),
+      r.carryOut ? h('div', badge(`ยกออก ${fmt.num(r.carryOut)} ถุง`, 'blue')) : null,
+      r.carryIn ? h('div', badge(`รับยกมา ${fmt.num(r.carryIn)} ถุง`, 'green')) : null) },
+    { key: 'product', label: 'สินค้า / Bag', render: (r) => h('span', r.product, h('div.sub', r.bagType || '-')) },
+    { key: 'nextLoad', label: 'Loading date', render: (r) => (r.nextLoad ? h('span', h('b', d2(r.nextLoad)), r.loadConts ? h('div.sub', `🚚 ${r.loadConts} ตู้ · ${fmt.num(r.loadBags)} ถุง`) : null) : '–') },
+    { key: 'plannedBags', label: 'แผน (ถุง)', type: 'number', editable: (r) => !r.rolledOver, num: true, step: 1, min: 0, width: '100px' },
+    { key: 'actualBags', label: 'บรรจุจริง ✎', type: 'number', editable: true, num: true, step: 1, min: 0, width: '110px' },
+    { key: 'plannedMt', label: 'แผน (ตัน)', num: true, render: (r) => fmt.num(r.plannedMt, 2) },
+    { key: 'actualMt', label: 'จริง (ตัน)', num: true, render: (r) => (r.actualMt == null ? '–' : h('b', fmt.num(r.actualMt, 2))) },
+    { key: 'variance', label: 'ส่วนต่าง (ถุง / ตัน)', num: true, render: (r) => (r.variance == null ? '–' : h('b', { style: { color: r.variance > 0 ? 'var(--yellow)' : r.variance < 0 ? 'var(--red)' : 'var(--green)' } }, fmt.signed(-r.variance), h('div.sub', `${fmt.signed(-r.varianceMt, 2)} ตัน`))) },
+    { key: 'status', label: 'สถานะ', render: (r) => h('span', badge(...STATUS[r.status]), r.rolledOver ? h('div.sub', 'ปัดยอดแล้ว') : null) },
+    { key: 'total', label: 'สะสม / ถุงทั้งหมด', render: (r) => h('span', { style: { color: r.packedTotal - r.carryOut > r.shipmentBags ? 'var(--red)' : null } }, `${fmt.num(r.packedTotal - r.carryOut)} / ${fmt.num(r.shipmentBags)}`) },
+    { key: 'note', label: 'หมายเหตุ', type: 'text', editable: true, width: '160px' },
+  ];
   const grid = dataGrid({
     id: 'packdaily',
+    columns,
     rows: b.rows,
     rowClass: (r) => (r.status === 'short' ? 'row-yellow' : r.status === 'over' ? 'row-red' : r.status === 'match' ? 'row-green' : ''),
     onChange: async (r, key, value) => {
-      const body = { shipmentId: r.shipmentId, lineCode: r.lineCode };
+      const body = { shipmentId: r.shipmentId, lineCode: r.lineCode, date: r.date };
       if (key === 'plannedBags') body.plannedBags = value ?? 0;
       if (key === 'actualBags') body.actualBags = value;
       if (key === 'note') body.note = value;
       const res = await put(body);
       if (!res) throw new Error('');
+      showCarry(res.carry);
       rerender();
     },
-    columns: [
-      { key: 'lineCode', label: 'สาย', render: (r) => h('b', r.lineCode) },
-      { key: 'code', label: 'Shipment', render: (r) => h('span', h('span.mono', r.code), h('div.sub', r.customerName || '')) },
-      { key: 'product', label: 'สินค้า / Bag', render: (r) => h('span', r.product, h('div.sub', r.bagType || '-')) },
-      { key: 'nextLoad', label: 'Loading date', render: (r) => (r.nextLoad ? h('span', h('b', fmt.date(r.nextLoad, { day: 'numeric', month: 'short' })), r.loadConts ? h('div.sub', `🚚 ${r.loadConts} ตู้ · ${fmt.num(r.loadBags)} ถุง`) : null) : '–') },
-      { key: 'plannedBags', label: 'แผน (ถุง)', type: 'number', editable: (r) => !r.rolledOver, num: true, step: 1, min: 0, width: '100px' },
-      { key: 'actualBags', label: 'บรรจุจริง ✎', type: 'number', editable: (r) => !r.rolledOver, num: true, step: 1, min: 0, width: '110px' },
-      { key: 'plannedMt', label: 'แผน (ตัน)', num: true, render: (r) => fmt.num(r.plannedMt, 2) },
-      { key: 'actualMt', label: 'จริง (ตัน)', num: true, render: (r) => (r.actualMt == null ? '–' : h('b', fmt.num(r.actualMt, 2))) },
-      { key: 'variance', label: 'ส่วนต่าง (ถุง / ตัน)', num: true, render: (r) => (r.variance == null ? '–' : h('b', { style: { color: r.variance > 0 ? 'var(--yellow)' : r.variance < 0 ? 'var(--red)' : 'var(--green)' } }, fmt.signed(r.variance), h('div.sub', `${fmt.signed(r.varianceMt, 2)} ตัน`))) },
-      { key: 'status', label: 'สถานะ', render: (r) => badge(...STATUS[r.status]) },
-      { key: 'ready', label: 'ความพร้อมโหลด', render: (r) => (r.readiness.firstShort ? h('span', { style: { color: 'var(--red)', fontWeight: 600 } }, `ขาด ${r.readiness.firstShort.short}`, h('div.sub', `โหลด ${fmt.date(r.readiness.firstShort.date, { day: 'numeric', month: 'short' })}`)) : h('span', { style: { color: 'var(--green)' } }, '✓ พอ')) },
-      { key: 'note', label: 'หมายเหตุ', type: 'text', editable: (r) => !r.rolledOver, width: '160px' },
-    ],
     actions: (r) => (r.recordId ? h('button.icon-btn.del', {
       type: 'button', title: 'ลบรายการนี้',
       onclick: async () => {
-        if (!(await confirmDialog('ลบรายการบรรจุ', `ลบรายการ ${r.code} (${r.lineCode}) วันที่ ${fmt.date(state.date)}?`, { okLabel: 'ลบ', okCls: 'danger' }))) return;
-        try { await api.del(`/kk/packing/records/${r.recordId}`); toast('ลบแล้ว', 'success', 1500); rerender(); } catch (e) { toast(e.message, 'error'); }
+        if (!(await confirmDialog('ลบรายการบรรจุ', `ลบรายการ ${r.code} (${r.lineCode}) วันที่ ${fmt.date(r.date)}?`, { okLabel: 'ลบ', okCls: 'danger' }))) return;
+        try { const res = await api.del(`/kk/packing/records/${r.recordId}`); showCarry(res?.carry); toast('ลบแล้ว', 'success', 1500); rerender(); } catch (e) { toast(e.message, 'error'); }
       },
     }, '🗑') : null),
-    emptyText: 'ไม่มีแผนบรรจุในวันนี้ — เพิ่มรายการด้านล่าง หรือวางแผนที่หน้า "แผนบรรจุถุง"',
+    emptyText: single ? 'ไม่มีแผนบรรจุในวันนี้ — เพิ่มรายการด้านล่าง หรือวางแผนที่หน้า "แผนบรรจุถุง"' : 'ไม่มีรายการบรรจุในช่วงนี้',
   });
 
-  const ships = await api.get(`/kk/packing?site=${encodeURIComponent(site.code)}&from=${state.date}&days=1&showAll=true`);
+  // เพิ่มรายการ (เลือกวันได้)
+  const ships = await api.get(`/kk/packing?site=${encodeURIComponent(site.code)}&from=${state.from}&days=1&showAll=true`);
   const shipSel = selectEl(ships.rows.map((r) => ({ value: r.id, label: `${r.code} · ${r.product} (${r.line || '-'})` })), ships.rows[0]?.id, { style: { minWidth: '280px' } });
+  const dateInp = h('input.inp', { type: 'date', value: single ? state.from : state.to });
   const planInp = h('input.inp', { type: 'number', min: 0, step: 1, placeholder: 'แผน', style: { width: '100px' } });
   const actInp = h('input.inp', { type: 'number', min: 0, step: 1, placeholder: 'จริง', style: { width: '100px' } });
   const add = async (e) => {
     e.preventDefault();
     const row = ships.rows.find((r) => r.id === shipSel.value);
     if (!row) return;
-    const body = { shipmentId: row.id, lineCode: row.line };
+    if (!dateInp.value) { toast('เลือกวันที่บรรจุ', 'warn'); return; }
+    const body = { shipmentId: row.id, lineCode: row.line, date: dateInp.value };
     if (planInp.value !== '') body.plannedBags = Number(planInp.value);
     if (actInp.value !== '') body.actualBags = Number(actInp.value);
     if (body.plannedBags == null && body.actualBags == null) { toast('กรอกจำนวนถุงแผนหรือจริง', 'warn'); return; }
-    if (await put(body)) rerender();
+    const res = await put(body);
+    if (res) { showCarry(res.carry); rerender(); }
   };
 
   root.append(h('div.card',
-    h('div.card-head', h('h2', 'บันทึกบรรจุจริง: แผน vs จริง (ถุง)'), h('span.hint', 'แถวเหลือง = บรรจุขาด → กดปัดยอดไปวันถัดไป · แถวแดง = บรรจุเกินแผน')),
+    h('div.card-head', h('h2', `บันทึกบรรจุจริง: แผน vs จริง (${b.rows.length} รายการ)`), h('span.hint', 'แก้ช่อง "บรรจุจริง" ได้เลยถ้ากรอกผิด · แถวเหลือง = บรรจุขาด · แถวแดง = บรรจุเกินแผนของวันนั้น')),
     grid,
-    ships.rows.length ? h('form.addrow', { onsubmit: add }, field('Shipment', shipSel), field('ถุงตามแผน', planInp), field('ถุงบรรจุจริง', actInp), h('button.btn.primary', { type: 'submit' }, '+ เพิ่มรายการบรรจุ')) : null));
+    ships.rows.length ? h('form.addrow', { onsubmit: add }, field('วันที่บรรจุ', dateInp), field('Shipment', shipSel), field('ถุงตามแผน', planInp), field('ถุงบรรจุจริง', actInp), h('button.btn.primary', { type: 'submit' }, '+ เพิ่มรายการบรรจุ')) : null));
+
+  root.append(transferCard(transfers, site, rerender));
+}
+
+function transferCard(list, site, rerender) {
+  return h('div.card',
+    h('div.card-head', h('h2', `ยกยอดถุงบรรจุเกิน (${list.length})`),
+      h('span.hint', 'เมื่อบรรจุจริงรวมเกินจำนวนถุงของ Shipment ส่วนเกินจะยกไป Shipment ถัดไปที่รหัสสินค้าตรงกันทุกตัว เช่น 1QLL2060MM07N1200 (เรียงตาม Loading date) · แก้ยอดจริงให้ลดลง ระบบดึงคืนให้เอง'),
+      h('div.spacer'),
+      h('button.btn.small', {
+        type: 'button', title: 'คำนวณการยกยอดใหม่ทั้งหมด',
+        onclick: async () => { const r = await api.post('/kk/packing/rebalance', { siteCode: site.code }); showCarry(r.carry); if (!r.carry.length) toast('ยอดยกถูกต้องแล้ว', 'success', 1500); rerender(); },
+      }, '↻ คำนวณยกยอดใหม่')),
+    list.length ? h('div.grid-wrap', h('table.grid',
+      h('thead', h('tr', ['วันที่', 'รหัสสินค้า', 'จาก Shipment', '', 'ไป Shipment', 'ถุง'].map((t) => h('th', t)))),
+      h('tbody', list.map((t) => h('tr',
+        h('td.ro', fmt.date(t.date)), h('td.ro', h('b', t.product || '-')),
+        h('td.ro.mono', t.fromCode), h('td.ro', '→'), h('td.ro.mono', t.toCode),
+        h('td.ro.num', h('b', fmt.num(t.bags)))))))) : h('div.empty', 'ยังไม่มีการยกยอด'));
 }
 
 async function doRollover(site, rerender) {
-  if (!(await confirmDialog('ปัดยอดบรรจุขาดไปวันถัดไป', `รายการที่บรรจุจริงน้อยกว่าแผนของวันที่ ${state.date} จะถูกย้ายส่วนที่ขาดไปวันทำงานถัดไป (สายเดิม)`, { okLabel: 'ปัดยอด', okCls: 'warn' }))) return;
+  if (!(await confirmDialog('ปัดยอดบรรจุขาดไปวันถัดไป', `รายการที่บรรจุจริงน้อยกว่าแผนของวันที่ ${state.from} จะถูกย้ายส่วนที่ขาดไปวันทำงานถัดไป (สายเดิม)`, { okLabel: 'ปัดยอด', okCls: 'warn' }))) return;
   try {
-    const r = await api.post('/kk/packing/rollover', { siteCode: site.code, date: state.date });
+    const r = await api.post('/kk/packing/rollover', { siteCode: site.code, date: state.from });
     modal({
       title: `ปัดยอดไปวันที่ ${r.toDate}`,
       narrow: true,
