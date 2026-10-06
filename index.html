@@ -3179,7 +3179,7 @@ const { parseExportPlan, applyImport } = __require("backend/services/kk/importer
 const { planGrid, planCsv, unitsCsv, shipmentDetail, dailySummary, dashboard } = __require("backend/services/kk/views.js");
 const { XLSX_MIME } = __require("backend/lib/xlsxWrite.js");
 const {
-  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, reconcilePlan, resetPlanTarget, transfersOf, packDailyRange, carryIn, carryOut,
+  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, reconcilePlan, reconcileSite, resetPlanTarget, transfersOf, packDailyRange, carryIn, carryOut,
 } = __require("backend/services/kk/packing.js");
 
 const kkRouter = Router();
@@ -3526,7 +3526,9 @@ kkRouter.delete('/packing-lines/:id', (req, res) => {
 });
 
 kkRouter.get('/packing', (req, res) => {
-  res.json(packGrid({ siteCode: req.query.site || 'KK', from: req.query.from, days: Number(req.query.days || 21), q: req.query.q || '', showAll: req.query.showAll === 'true' }));
+  // เปิดหน้าแผนบรรจุ → กระทบยอดแผนให้อัตโนมัติก่อนแสดง (ไม่ต้องกดปุ่ม)
+  const reconciled = req.query.reconcile === 'false' ? [] : reconcileSite(req.query.site || 'KK');
+  res.json({ reconciled, ...packGrid({ siteCode: req.query.site || 'KK', from: req.query.from, days: Number(req.query.days || 21), q: req.query.q || '', showAll: req.query.showAll === 'true' }) });
 });
 kkRouter.get('/packing/daily', (req, res) => {
   if (req.query.from && req.query.to) return res.json(packDailyRange(req.query.site || 'KK', req.query.from, req.query.to));
@@ -3541,23 +3543,7 @@ kkRouter.post('/packing/rebalance', (req, res) => {
   res.json({ carry });
 });
 // กระทบยอดแผนบรรจุทั้งหน้างาน (ทุกสินค้า): ปรับแผนวันถัดไปให้พอดีกับยอดบรรจุจริง
-kkRouter.post('/packing/reconcile', (req, res) => {
-  const site = req.body.siteCode || 'KK';
-  const changes = [];
-  store.transaction(() => {
-    const ships = store.find('shipments', (s) => s.siteCode === site);
-    for (const s of ships) changes.push(...rebalanceCarry(s.id));
-    const done = new Set();
-    for (const s of ships) {
-      const k = String(s.product || '').trim().replace(/\s+/g, ' ').toUpperCase();
-      const key = !k || k === '-' || k.includes(' + ') ? s.id : k;
-      if (done.has(key)) continue;
-      done.add(key);
-      changes.push(...reconcilePlan(s.id));
-    }
-  });
-  res.json({ carry: changes });
-});
+kkRouter.post('/packing/reconcile', (req, res) => res.json({ carry: reconcileSite(req.body.siteCode || 'KK') }));
 kkRouter.put('/packing/records', (req, res) => {
   res.json(setPackingRecord(req.body, { force: isForce(req) }));
 });
@@ -4361,6 +4347,7 @@ Object.defineProperty(__exports, "carryOut", { enumerable: true, get: () => carr
 Object.defineProperty(__exports, "openingOf", { enumerable: true, get: () => openingOf });
 Object.defineProperty(__exports, "rebalanceCarry", { enumerable: true, get: () => rebalanceCarry });
 Object.defineProperty(__exports, "reconcilePlan", { enumerable: true, get: () => reconcilePlan });
+Object.defineProperty(__exports, "reconcileSite", { enumerable: true, get: () => reconcileSite });
 Object.defineProperty(__exports, "resetPlanTarget", { enumerable: true, get: () => resetPlanTarget });
 Object.defineProperty(__exports, "transfersOf", { enumerable: true, get: () => transfersOf });
 Object.defineProperty(__exports, "lineUsageMt", { enumerable: true, get: () => lineUsageMt });
@@ -4620,6 +4607,23 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
   }
   const left = queue.filter((q) => q.need > 0 && hadPlan.has(q.s.id));
   for (const q of left) changes.push({ type: 'unplanned', code: q.s.code, product: q.s.product, mt: round(q.need * q.w, 2) });
+  return changes;
+}
+
+/** กระทบยอดทั้งหน้างาน (ทุกสินค้า): ยกยอดถุงเกิน + ปรับแผนวันถัดไป — เรียกซ้ำได้ ผลลัพธ์คงเดิม */
+function reconcileSite(siteCode) {
+  const changes = [];
+  store.transaction(() => {
+    const ships = store.find('shipments', (s) => s.siteCode === siteCode);
+    for (const s of ships) changes.push(...rebalanceCarry(s.id));
+    const done = new Set();
+    for (const s of ships) {
+      const key = prodKey(s) || s.id;
+      if (done.has(key)) continue;
+      done.add(key);
+      changes.push(...reconcilePlan(s.id));
+    }
+  });
   return changes;
 }
 
@@ -9352,6 +9356,7 @@ async function render(root, { rerender, kkMeta }) {
   if (!site) { root.append(h('div.card.empty', 'ยังไม่มีหน้างาน')); return; }
   state.from ??= addDays(kkMeta.today, -1);
   const g = await api.get(`/kk/packing?site=${encodeURIComponent(site.code)}&from=${state.from}&days=${state.days}&q=${encodeURIComponent(state.q)}`);
+  if (g.reconciled?.length) showCarry(g.reconciled);
   const k = g.kpis;
   const go = (n) => { state.from = addDays(state.from, n); rerender(); };
 
