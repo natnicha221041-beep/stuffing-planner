@@ -4534,7 +4534,16 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
     const mt = r.plannedBags * mtPerBag(store.get('shipments', r.shipmentId));
     slotMap.set(k, { date: r.date, lineCode: r.lineCode, mt: (slotMap.get(k)?.mt ?? 0) + mt });
   }
-  const slots = [...slotMap.values()].sort((a, b) => a.date.localeCompare(b.date) || a.lineCode.localeCompare(b.lineCode));
+  // ช่องแผนต่อวันต้องไม่เกินกำลังสาย (หัก Shipment อื่นที่ไม่ใช่สินค้านี้) — งานที่ทับกันจะเลื่อนไปวันถัดไป
+  const wRef = mtPerBag(s0) || 1;
+  for (const sl of slotMap.values()) {
+    const line = store.findOne('packingLines', (l) => l.code === sl.lineCode && l.siteCode === s0.siteCode);
+    if (!line?.maxBagsPerDay) continue;
+    const other = store.find('packingRecords', (r) => r.lineCode === sl.lineCode && r.date === sl.date && !(ids.has(r.shipmentId) && plannable(r)))
+      .reduce((a, r) => a + effBags(r) * (mtPerBag(store.get('shipments', r.shipmentId)) || wRef), 0);
+    sl.mt = Math.max(0, Math.min(sl.mt, line.maxBagsPerDay * wRef - other));
+  }
+  const slots = [...slotMap.values()].filter((x) => x.mt > 1e-6).sort((a, b) => a.date.localeCompare(b.date) || a.lineCode.localeCompare(b.lineCode));
   const hadPlan = new Set(open.map((r) => r.shipmentId)); // ต่อแผนเฉพาะ Shipment ที่มีแผนวันข้างหน้าอยู่แล้ว
   const before = new Map(open.map((r) => [`${r.shipmentId}|${r.date}|${r.lineCode}`, r.plannedBags]));
 
@@ -5222,11 +5231,10 @@ function lineRate(line, today = todayISO()) {
   }
   const vals = Object.values(byDate).filter((v) => v > 0);
   const cap = Number(line.maxBagsPerDay || 0);
-  if (vals.length >= 2) {
-    const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
-    return { rate: cap ? Math.min(cap, avg) : avg, cap, source: 'actual', avgActual: avg, days: vals.length };
-  }
-  return { rate: cap, cap, source: 'capacity', avgActual: null, days: vals.length };
+  // ใช้กำลังสายที่ผู้ใช้ตั้งไว้เป็นหลัก (วันที่บรรจุน้อยเพราะงานหมด ไม่ควรดึงอัตราลง) · ค่าเฉลี่ยจริงแสดงไว้อ้างอิง
+  const avg = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : null;
+  if (cap > 0) return { rate: cap, cap, source: 'capacity', avgActual: avg, days: vals.length };
+  return vals.length >= 2 ? { rate: avg, cap, source: 'actual', avgActual: avg, days: vals.length } : { rate: 0, cap, source: 'capacity', avgActual: avg, days: vals.length };
 }
 
 /**
@@ -5256,8 +5264,12 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
     const demandUnits = units.filter((u) => !u.assumed && u.planDate);
     const bagsOfUnit = (u) => (u.status === 'loaded' && u.actualBags != null ? u.actualBags : per);
     const loadDates = [...new Set(demandUnits.map((u) => u.planDate))].sort().filter((d) => d >= today);
-    const fixed = s.packLine && lineMap.has(s.packLine) ? s.packLine : null; // ไม่ระบุสาย = ใช้ได้ทุกสายของหน้างาน
-    const line = fixed ? lineMap.get(fixed) : lineOfShipment(s);
+    // สายที่ใช้บรรจุ: ตามแผนบรรจุที่ลงไว้ (แผนข้างหน้าก่อน ไม่มีก็ใช้สายที่เคยบรรจุ) → ระบุสายใน Shipment → ไม่มีเลยจึงใช้ทุกสายร่วมกัน
+    const futureLines = [...new Set(recs.filter((r) => r.date >= today && (r.plannedBags || 0) > 0 && lineMap.has(r.lineCode)).map((r) => r.lineCode))];
+    const anyLines = [...new Set(recs.filter((r) => lineMap.has(r.lineCode)).map((r) => r.lineCode))];
+    const fixedList = futureLines.length ? futureLines : anyLines.length ? anyLines : s.packLine && lineMap.has(s.packLine) ? [s.packLine] : [];
+    const fixed = fixedList.length ? new Set(fixedList) : null;
+    const line = fixed ? lineMap.get(fixedList[0]) : lineOfShipment(s);
     const rec = {
       s, per, line: line?.code ?? null, have: have + todayActual, tranches: [], loadDates,
       unplannedConts: Math.max(0, s.conts - demandUnits.length - units.filter((u) => u.assumed).length),
@@ -5293,7 +5305,7 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
       let used = 0;
       for (const t of allT) {
         if (cap <= 0) break;
-        if (t.left <= 0 || (t.fixed && t.fixed !== L.code)) continue;
+        if (t.left <= 0 || (t.fixed && !t.fixed.has(L.code))) continue;
         const take = Math.min(cap, t.left);
         t.left -= take; cap -= take; used += take; L.backlogMt += take * t.mpb;
         t.lines.add(L.code);
@@ -5302,7 +5314,7 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
       if (used > 0) { L.workDays += 1; L.backlog += used; L.lastFinish = d; }
     }
   }
-  for (const L of lines) L.unfinished = allT.filter((t) => t.left > 0 && (!t.fixed || t.fixed === L.code)).length;
+  for (const L of lines) L.unfinished = allT.filter((t) => t.left > 0 && (!t.fixed || t.fixed.has(L.code))).length;
 
   const workdaysBetween = (a, b) => { // จำนวนวันทำงานจาก a (รวม) ถึง b (รวม)
     let n = 0;
@@ -5323,7 +5335,8 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
     const lastLoad = r.loadDates.at(-1) ?? null;
     const L = r.line ? lineMap.get(r.line) : null;
     const usedLines = [...new Set(r.tranches.flatMap((t) => [...t.lines]))];
-    const poolRate = r.tranches.some((t) => t.fixed) ? (L?.rate ?? 0) : lines.reduce((a, l) => a + (l.rate || 0), 0);
+    const fx = r.tranches.find((t) => t.fixed)?.fixed;
+    const poolRate = fx ? lines.filter((l) => fx.has(l.code)).reduce((a, l) => a + (l.rate || 0), 0) : lines.reduce((a, l) => a + (l.rate || 0), 0);
     const daysNeeded = need.length && readyDate ? workdaysBetween(today, readyDate) : need.length ? null : 0;
     let level; let label; let headline = ''; const reasons = [];
     if (!r.loadDates.length) {
@@ -5369,7 +5382,11 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
     lines: lines.map((L) => {
       const lastDeadline = allT.filter((t) => t.lines.has(L.code)).reduce((m, t) => (t.deadline > m ? t.deadline : m), today);
       const capDays = workdaysBetween(today, lastDeadline);
+      // ความคืบหน้าของสาย = บรรจุจริงแล้ว ÷ (บรรจุจริงแล้ว + งานที่ยังต้องบรรจุ) ของ Shipment ที่ยังส่งออกไม่ครบ
+      const doneMt = ships.reduce((a, r) => a + recordsOf(r.s.id).filter((x) => x.lineCode === L.code && x.actualBags != null).reduce((b, x) => b + x.actualBags * mtPerBag(r.s), 0), 0);
+      const totalMt = doneMt + L.backlogMt;
       return {
+        doneMt: round(doneMt, 2), donePct: totalMt > 0 ? Math.min(100, Math.round((doneMt / totalMt) * 100)) : null,
         code: L.code, name: L.name, cap: L.cap, rate: L.rate, source: L.source, avgActual: L.avgActual,
         backlogBags: L.backlog, workDays: L.workDays, lastFinish: L.lastFinish || null, unfinished: L.unfinished,
         load: L.rate && capDays ? round((L.backlog / (L.rate * capDays)) * 100, 0) : null,
@@ -9137,21 +9154,23 @@ function upcoming(g, site, rerender) {
 function linesCard(g) {
   if (!g.lines.length) return h('div');
   const bar = (l) => {
-    if (l.load == null) return '–';
-    const color = l.load > 100 ? 'var(--red-bar)' : l.load >= 85 ? 'var(--yellow)' : 'var(--green)';
-    return h('div.mini-bar', h('i', { style: { width: `${Math.min(100, l.load)}%`, background: color } }), h('span', `${l.load}%`));
+    if (l.donePct == null) return h('span.sub', 'ยังไม่มีงานในสาย');
+    const color = l.donePct >= 100 ? 'var(--green)' : 'var(--primary)';
+    return h('div', h('div.mini-bar', h('i', { style: { width: `${l.donePct}%`, background: color } }), h('span', `${l.donePct}%`)),
+      h('div.sub', l.donePct >= 100 ? `บรรจุครบแล้ว ${fmt.num(l.doneMt, 2)} ตัน` : `บรรจุแล้ว ${fmt.num(l.doneMt, 2)} / ${fmt.num(l.doneMt + l.backlogMt, 2)} ตัน`));
   };
+  const loadTxt = (l) => (l.load == null || !l.workDays ? '' : ` · ใช้กำลังสาย ${l.load}% ถึงวันโหลด`);
   const body = g.lines.map((l) => h('tr',
     h('td.ro', h('b', l.code), h('div.sub', l.name || '')),
-    h('td.ro', `${fmt.num(l.rate)} ถุง/วัน`, h('div.sub', l.source === 'actual' ? `เฉลี่ยยอดจริง 7 วัน (กำลังสาย ${fmt.num(l.cap)})` : 'กำลังสายที่ตั้งไว้')),
+    h('td.ro', `${fmt.num(l.rate)} ถุง/วัน`, h('div.sub', l.source === 'actual' ? 'เฉลี่ยยอดจริง 7 วัน (ยังไม่ได้ตั้งกำลังสาย)' : `กำลังสายที่ตั้งไว้${l.avgActual != null ? ` · เฉลี่ยจริง 7 วัน ${fmt.num(l.avgActual)} ถุง` : ''}`)),
     h('td.ro.num', h('b', `${fmt.num(l.backlogBags)} ถุง`), h('div.sub', `${fmt.num(l.backlogMt, 1)} ตัน`)),
-    h('td.ro.num', `${l.workDays} วันทำงาน`),
+    h('td.ro.num', l.workDays ? `${l.workDays} วันทำงาน` : '–', h('div.sub', loadTxt(l).replace(/^ · /, ''))),
     h('td.ro', l.lastFinish ? dshort(l.lastFinish) : '–'),
-    h('td.ro', { style: { minWidth: '160px' } }, bar(l))));
+    h('td.ro', { style: { minWidth: '180px' } }, bar(l))));
   return h('div.card',
-    h('div.card-head', h('h2', 'กำลังบรรจุ & งานค้างต่อสาย'), h('span.hint', 'งานค้าง = ถุงที่ต้องบรรจุให้ทันทุกวันโหลดที่ลงแผนไว้')),
+    h('div.card-head', h('h2', 'กำลังบรรจุ & งานค้างต่อสาย'), h('span.hint', 'งานค้าง = ถุงที่ต้องบรรจุให้ทันทุกวันโหลด คิดตามสายที่ลงแผนบรรจุไว้ · % = บรรจุจริงแล้วเทียบกับงานทั้งหมดของสาย')),
     h('div.grid-wrap', h('table.grid',
-      h('thead', h('tr', ['สาย', 'อัตราที่ใช้คาดการณ์', 'งานค้าง', 'ใช้เวลา', 'เสร็จทั้งหมด', 'โหลดงานก่อนถึงกำหนด'].map((t) => h('th', t)))),
+      h('thead', h('tr', ['สาย', 'อัตราที่ใช้คาดการณ์', 'งานค้าง', 'ใช้เวลา', 'เสร็จทั้งหมด', 'ความคืบหน้าบรรจุ'].map((t) => h('th', t)))),
       h('tbody', body))));
 }
 
@@ -9684,7 +9703,7 @@ function forecastCard(fc) {
   return h('div.card',
     h('div.card-head', h('h2', 'คาดการณ์: ต้องบรรจุอีกกี่วันถึงทันวัน Loading'),
       badge(`✅ ${c.green}`, 'green'), badge(`⚠ ${c.yellow}`, 'yellow'), badge(`❌ ${c.red}`, 'red'),
-      h('span.hint', `อัตรา: ${fc.lines.map((l) => `${l.code} ${fmt.num(l.rate)} ถุง/วัน${l.source === 'actual' ? ' (เฉลี่ยจริง)' : ''}`).join(' · ')}`)),
+      h('span.hint', `อัตรา: ${fc.lines.map((l) => `${l.code} ${fmt.num(l.rate)} ถุง/วัน${l.source === 'actual' ? ' (เฉลี่ยจริง)' : ' (กำลังสาย)'}`).join(' · ')}`)),
     rows.length ? h('div.grid-wrap', { style: { maxHeight: '340px' } }, h('table.grid',
       h('thead', h('tr', ['Shipment', 'สินค้า', 'Loading ถัดไป', 'ต้องบรรจุอีก', 'ตัน', 'ใช้เวลา', 'ถุงพร้อม', 'เผื่อ', 'ความเสี่ยง', 'เหตุผล'].map((t) => h('th', t)))),
       h('tbody', rows.map((f) => h(`tr${f.level === 'red' ? '.row-red' : f.level === 'yellow' ? '.row-yellow' : ''}`,
