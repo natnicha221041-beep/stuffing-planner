@@ -367,6 +367,11 @@ table.pgrid td.pc.clickable { cursor: pointer; }
 table.pgrid td.pc.clickable:hover { outline: 2px solid var(--primary); outline-offset: -2px; }
 table.pgrid td.pc .past .sub { font-size: 10px; font-weight: 400; }
 
+/* Loading date editor: ตัวเลขชิดขวาตรงหัวคอลัมน์ */
+.grid th.num{text-align:right}
+.grid td.num{text-align:right}
+.inp.load-num{width:100%;max-width:140px;text-align:right;padding:4px 8px}
+
 </style>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='8' width='26' height='16' rx='2' fill='%231d4ed8'/><path d='M9 11v10M14 11v10M19 11v10M24 11v10' stroke='white' stroke-width='2'/></svg>" />
 </head>
@@ -4353,6 +4358,8 @@ Object.defineProperty(__exports, "transfersOf", { enumerable: true, get: () => t
 Object.defineProperty(__exports, "lineUsageMt", { enumerable: true, get: () => lineUsageMt });
 Object.defineProperty(__exports, "lineUsage", { enumerable: true, get: () => lineUsage });
 Object.defineProperty(__exports, "lineLevel", { enumerable: true, get: () => lineLevel });
+Object.defineProperty(__exports, "unitBagsFn", { enumerable: true, get: () => unitBagsFn });
+Object.defineProperty(__exports, "loadBagsOn", { enumerable: true, get: () => loadBagsOn });
 Object.defineProperty(__exports, "readiness", { enumerable: true, get: () => readiness });
 Object.defineProperty(__exports, "validatePackingShipment", { enumerable: true, get: () => validatePackingShipment });
 Object.defineProperty(__exports, "validateLineDay", { enumerable: true, get: () => validateLineDay });
@@ -4385,7 +4392,7 @@ Object.defineProperty(__exports, "packDailyRange", { enumerable: true, get: () =
 const { store } = __require("backend/db/store.js");
 const { todayISO, addDays, isISODate, dateRange } = __require("backend/utils/date.js");
 const { badRequest, notFound, ValidationBlockedError } = __require("backend/utils/errors.js");
-const { siteOf, unitsOf, bagsPerCont, round } = __require("backend/services/kk/core.js");
+const { siteOf, unitsOf, bagsPerCont, round, planMt } = __require("backend/services/kk/core.js");
 const { readWorkbook, isDateSerial, serialToISO, colToNum } = __require("backend/lib/xlsx.js");
 const { buildXlsx } = __require("backend/lib/xlsxWrite.js");
 
@@ -4657,6 +4664,32 @@ function lineLevel(used, cap) {
   return 'green';
 }
 
+/**
+ * ถุงที่ต้องใช้ต่อช่องตู้: ถ้ามีน้ำหนักต่อถุง ใช้ "ตันของ Loading date ÷ น้ำหนักต่อถุง" แบ่งเท่ากันในวันนั้น
+ * (เช่น 250 ตัน ÷ 1.25 = 200 ถุง / 10 ตู้) · ไม่งั้นใช้ ถุงรวม ÷ ตู้รวม · ตู้ที่โหลดแล้วและมียอดจริงใช้ยอดจริง
+ */
+function unitBagsFn(s) {
+  const per = bagsPerCont(s);
+  const w = mtPerBag(s);
+  const units = unitsOf(s.id).filter((u) => !u.assumed && u.planDate);
+  const cache = new Map();
+  const perOn = (d) => {
+    if (cache.has(d)) return cache.get(d);
+    let v = per;
+    const p = w > 0 ? store.findOne('shipmentPlans', (x) => x.shipmentId === s.id && x.date === d && x.conts > 0) : null;
+    const n = units.filter((u) => u.planDate === d).length;
+    if (p && n) v = planMt(p, s) / w / Math.max(n, p.conts); // ตันของวัน ÷ น้ำหนักถุง ÷ ตู้ของวันนั้น
+    cache.set(d, v);
+    return v;
+  };
+  return (u) => (u.status === 'loaded' && u.actualBags != null ? u.actualBags : u.planDate ? perOn(u.planDate) : per);
+}
+/** ถุงที่ต้องใช้ของตู้ทั้งหมดในวันโหลด d */
+function loadBagsOn(s, d) {
+  const f = unitBagsFn(s);
+  return Math.round(unitsOf(s.id).filter((u) => !u.assumed && u.planDate === d).reduce((a, u) => a + f(u), 0));
+}
+
 /** ความพร้อมของถุงก่อนวันโหลดตู้ */
 function readiness(s, today = todayISO()) {
   const per = bagsPerCont(s);
@@ -4669,7 +4702,7 @@ function readiness(s, today = todayISO()) {
   const recs = recordsOf(s.id);
   const supplyBy = (d) => opening + assumedBags + recs.filter((r) => r.date <= d).reduce((a, r) => a + effBags(r), 0);
   const demandUnits = units.filter((u) => !u.assumed && u.planDate);
-  const bagsOfUnit = (u) => (u.status === 'loaded' && u.actualBags != null ? u.actualBags : per);
+  const bagsOfUnit = unitBagsFn(s);
   const demandBy = (d) => demandUnits.filter((u) => u.planDate <= d).reduce((a, u) => a + bagsOfUnit(u), 0);
 
   const checks = [];
@@ -4866,7 +4899,7 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
         planned, actual, plannedMt: mtOf(s, planned), actualMt: mtOf(s, actual),
         otherLines: dayRecs.filter((x) => x.lineCode !== line?.code).map((x) => x.lineCode),
         loadConts,
-        loadBags: Math.round(loadConts * r.per),
+        loadBags: loadConts ? loadBagsOn(s, d) : 0,
         short: chk?.short ?? 0,
       };
     }
@@ -4928,7 +4961,7 @@ function packDaily(siteCode, date) {
         lineCode: rec.lineCode, plannedBags: planned, actualBags: rec.actualBags, variance, note: rec.note || '',
         status: rec.actualBags == null ? 'pending' : variance === 0 ? 'match' : variance > 0 ? 'short' : 'over',
         rolledOver: !!rec.rolledOver, rolloverNote: rec.rolloverNote || null,
-        loadConts: loadsToday, loadBags: Math.round(loadsToday * r.per), nextLoad,
+        loadConts: loadsToday, loadBags: loadsToday ? loadBagsOn(s, addDays(date, lead)) : 0, nextLoad,
         readiness: { status: r.status, firstShort: r.firstShort },
       });
     }
@@ -5266,7 +5299,7 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
     const have = openingOf(s) + assumedBags + recs.filter((r) => r.date < today).reduce((a, r) => a + effBags(r), 0);
     const todayActual = recs.filter((r) => r.date === today).reduce((a, r) => a + (r.actualBags ?? 0), 0);
     const demandUnits = units.filter((u) => !u.assumed && u.planDate);
-    const bagsOfUnit = (u) => (u.status === 'loaded' && u.actualBags != null ? u.actualBags : per);
+    const bagsOfUnit = unitBagsFn(s);
     const loadDates = [...new Set(demandUnits.map((u) => u.planDate))].sort().filter((d) => d >= today);
     // สายที่ใช้บรรจุ: ตามแผนบรรจุที่ลงไว้ (แผนข้างหน้าก่อน ไม่มีก็ใช้สายที่เคยบรรจุ) → ระบุสายใน Shipment → ไม่มีเลยจึงใช้ทุกสายร่วมกัน
     const futureLines = [...new Set(recs.filter((r) => r.date >= today && (r.plannedBags || 0) > 0 && lineMap.has(r.lineCode)).map((r) => r.lineCode))];
@@ -6487,11 +6520,11 @@ const { store } = __require("backend/db/store.js");
 const { dateRange, isISODate, todayISO, addDays } = __require("backend/utils/date.js");
 const { badRequest, notFound } = __require("backend/utils/errors.js");
 const {
-  siteOf, shipmentSummary, siteDayCount, levelOfCount, unitsOf, plansOf, planMt, closingInfo, estimateVgm, mtPerCont, LOCKED, UNIT_STATUS_LABEL, round, containerTracking,
+  siteOf, shipmentSummary, siteDayCount, levelOfCount, unitsOf, plansOf, planMt, closingInfo, estimateVgm, mtPerCont, bagsPerCont, LOCKED, UNIT_STATUS_LABEL, round, containerTracking,
 } = __require("backend/services/kk/core.js");
 const { validateShipment, validateSiteDay } = __require("backend/services/kk/rules.js");
 const { dayBoard } = __require("backend/services/kk/loading.js");
-const { readiness, validatePackingShipment, linesOf, lineUsage, needsPacking, packDayTotals, packForecast } = __require("backend/services/kk/packing.js");
+const { mtPerBag, readiness, validatePackingShipment, linesOf, lineUsage, needsPacking, packDayTotals, packForecast } = __require("backend/services/kk/packing.js");
 
 const weekday = (iso) => new Date(`${iso}T00:00:00Z`).getUTCDay();
 
@@ -6628,7 +6661,8 @@ function shipmentDetail(id) {
     ...sum,
     closing: closingInfo(s, site),
     vgm: estimateVgm(s),
-    plans: plansOf(s.id).filter((p) => p.conts > 0).sort((a, b) => a.date.localeCompare(b.date)).map((p) => ({ date: p.date, conts: p.conts, mt: planMt(p, s), mtManual: p.mt != null })),
+    plans: plansOf(s.id).filter((p) => p.conts > 0).sort((a, b) => a.date.localeCompare(b.date)).map((p) => ({ date: p.date, conts: p.conts, mt: planMt(p, s), mtManual: p.mt != null, bags: mtPerBag(s) > 0 ? Math.round(planMt(p, s) / mtPerBag(s)) : Math.round(p.conts * bagsPerCont(s)) })),
+    mtPerBag: round(mtPerBag(s), 4),
     units: unitsOf(s.id, { includeCancelled: true }).map((u) => ({ ...u, label: `${u.seq}/${s.conts}`, statusLabel: UNIT_STATUS_LABEL[u.status] })),
     issues,
     onTime: onTimeStatus(s, sum, issues, todayISO(), forecastMap(s.siteCode).get(s.id)),
@@ -8329,7 +8363,7 @@ function shipmentForm(s, kkMeta) {
   };
   inputs.mt.addEventListener('input', recalcBags);
   inputs.packingMtPerBag.addEventListener('input', recalcBags);
-  if (!s.packingMtPerBag && s.mt > 0 && s.bags > 0) inputs.packingMtPerBag.placeholder = `ปัจจุบัน ${(s.mt / s.bags).toFixed(2)}`;
+  if (!s.packingMtPerBag && s.mt > 0 && s.bags > 0) inputs.packingMtPerBag.value = (s.mt / s.bags).toFixed(2); // แสดงค่าจริงที่ใช้คำนวณ (ตันรวม ÷ ถุง)
   return { el: grid, values };
 }
 
@@ -8438,18 +8472,19 @@ function loadingEditor(s, markDirty) {
     wrap.replaceChildren(
       h('div.card-head', h('h2', 'Loading date (วันเข้าตู้)'),
         h(`span.badge.${totalC === s.conts ? 'green' : 'yellow'}`, `ลงแผน ${totalC}/${s.conts} ตู้ · ${fmt.num(totalT, 2)}/${fmt.num(s.mt, 2)} ตัน`),
-        h('span.hint', 'จำนวนตันเว้นว่าง = คำนวณจาก ตู้ × ตัน/ตู้')),
+        h('span.hint', 'จำนวนตันเว้นว่าง = คำนวณจาก ตู้ × ตัน/ตู้ · ถุง = จำนวนตัน ÷ น้ำหนักต่อถุง')),
       plans.length ? h('div.grid-wrap', { style: { maxHeight: '240px' } }, h('table.grid',
-        h('thead', h('tr', h('th', 'Loading date'), h('th', 'จำนวนตู้'), h('th', 'จำนวนตัน'), h('th', 'ถุง'), h('th', ''))),
+        h('colgroup', h('col', { style: { width: '38%' } }), h('col', { style: { width: '18%' } }), h('col', { style: { width: '22%' } }), h('col', { style: { width: '14%' } }), h('col', { style: { width: '8%' } })),
+        h('thead', h('tr', h('th', 'Loading date'), h('th.num', 'จำนวนตู้'), h('th.num', 'จำนวนตัน'), h('th.num', 'ถุง'), h('th', ''))),
         h('tbody', plans.map((p) => {
-          const c = h('input.cell', { type: 'number', min: 0, step: 1, value: p.conts });
-          const t = h('input.cell', { type: 'number', min: 0, step: '0.01', value: Number(p.mt).toFixed(2), title: p.mtManual ? 'กรอกเอง' : 'คำนวณจากตู้ × ตัน/ตู้' });
+          const c = h('input.inp.load-num', { type: 'number', min: 0, step: 1, value: p.conts });
+          const t = h('input.inp.load-num', { type: 'number', min: 0, step: '0.01', value: Number(p.mt).toFixed(2), title: p.mtManual ? 'กรอกเอง' : 'คำนวณจากตู้ × ตัน/ตู้' });
           c.addEventListener('change', () => put(p.date, Number(c.value || 0), null));
           t.addEventListener('change', () => put(p.date, p.conts, t.value === '' ? null : round2(Number(t.value))));
           return h('tr',
             h('td.ro', h('b', fmt.dateLong(p.date))),
-            h('td', c), h('td', t, p.mtManual ? null : h('div.sub', 'อัตโนมัติ')),
-            h('td.ro.num', s.bagsPerCont ? fmt.num(Math.round(p.conts * s.bagsPerCont)) : '–'),
+            h('td.num', c), h('td.num', t, p.mtManual ? null : h('div.sub', 'อัตโนมัติ (ตู้ × ตัน/ตู้)')),
+            h('td.ro.num', p.bags != null ? h('b', fmt.num(p.bags)) : '–', s.mtPerBag ? h('div.sub', `÷ ${Number(s.mtPerBag).toFixed(2)} ตัน/ถุง`) : null),
             h('td.grid-actions', h('button.icon-btn.del', {
               type: 'button', title: 'ลบวันนี้',
               onclick: async () => { if (await confirmDialog('ลบ Loading date', `ลบแผนเข้าตู้วันที่ ${fmt.dateLong(p.date)} (${p.conts} ตู้)?`, { okLabel: 'ลบ', okCls: 'danger' })) put(p.date, 0, null); },
