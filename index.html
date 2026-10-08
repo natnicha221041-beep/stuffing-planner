@@ -6827,11 +6827,13 @@ function onTimeStatus(s, sum, issues, today = todayISO(), fc = null) {
   if (pack?.firstShort) reasons.push(fc && fc.level === 'green'
     ? `แผนบรรจุยังไม่ครอบคลุมวันโหลด ${pack.firstShort.date} (ขาด ${pack.firstShort.short} ถุง) — กำลังสายทัน ให้ลงแผนบรรจุเพิ่ม`
     : `ถุงไม่พอโหลด ${pack.firstShort.date} (ขาด ${pack.firstShort.short} ถุง)`);
-  if (codes.has('NO_BOOKING')) reasons.push('ยังไม่มี Booking / สายเรือ');
-  if (codes.has('CLOSING_DAY')) reasons.push('มีแผนโหลดในวัน Closing');
-  if (codes.has('NO_CLOSING')) reasons.push('ยังไม่ทราบ Closing (ใช้ ETD)');
-  if (reasons.length) return { level: 'yellow', label: 'เสี่ยง', reasons };
-  return { level: 'green', label: 'ทัน', reasons: [`ลงแผนครบก่อน ${s.closingDate ? `Closing ${s.closingDate}` : `ETD ${s.etd}`}${pack ? ' · ถุงพร้อม' : ''}${fc?.daysNeeded ? ` · บรรจุอีก ${fc.daysNeeded} วันเสร็จ ${fc.readyDate}` : ''}`] };
+  // ข้อมูลเอกสารที่ยังรอ (ไม่กระทบว่าบรรจุ/โหลดทันหรือไม่) — แสดงเป็นหมายเหตุ ไม่นับเป็นความเสี่ยง
+  const pending = [];
+  if (codes.has('NO_BOOKING')) pending.push('รอ Booking / สายเรือ');
+  if (codes.has('NO_CLOSING')) pending.push('รอวัน Closing (ใช้ ETD)');
+  if (codes.has('CLOSING_DAY')) pending.push('มีโหลดในวัน Closing — ต้องเสร็จก่อนเวลาตัด');
+  if (reasons.length) return { level: 'yellow', label: 'เสี่ยง', reasons: [...reasons, ...pending], pending };
+  return { level: 'green', label: 'ทัน', pending, reasons: [...pending, `ลงแผนครบก่อน ${s.closingDate ? `Closing ${s.closingDate}` : `ETD ${s.etd}`}${pack ? ' · ถุงพร้อม' : ''}${fc?.daysNeeded ? ` · บรรจุอีก ${fc.daysNeeded} วันเสร็จ ${fc.readyDate}` : ''}`] };
 }
 
 // ---------------- สรุปรายวัน: สินค้า × วันที่ (จำนวนตู้) ----------------
@@ -9316,7 +9318,11 @@ function upcoming(g, site, rerender) {
           h('td.ro', h('b', r.product)),
           h('td.ro.num', h('b', r.nextLoadConts || '–'), h('span.muted', ` / ${r.conts}`), h('div.sub', `ในช่วงนี้ ${r.contsInRange} ตู้ · ${fmt.num(r.mtInRange, 2)} ตัน`)),
           h('td.ro', r.closingDate ? h('span.cl-tag', closingText(r)) : h('span.muted', r.etd ? `ETD ${dshort(r.etd)}` : 'รอ Closing')),
-          h('td.ro', r.state === 'done' || r.state === 'closed' ? h('span.badge.gray', '✔ ส่งออกแล้ว') : onTimeBadge(r.onTime)),
+          h('td.ro', r.state === 'done' || r.state === 'closed' ? h('span.badge.gray', '✔ ส่งออกแล้ว') : onTimeBadge(r.onTime),
+            // บอกเหตุผลให้เห็นเลย: เสี่ยงเพราะอะไร / ทันแต่ยังรอข้อมูลอะไร
+            r.onTime.level === 'yellow' || r.onTime.level === 'red'
+              ? h('div.sub.wrap', { style: { color: r.onTime.level === 'red' ? 'var(--red)' : '#92400e', maxWidth: '220px' } }, r.onTime.reasons.filter((x) => !(r.onTime.pending || []).includes(x)).join(' • '))
+              : r.onTime.pending?.length ? h('div.sub.wrap', { style: { maxWidth: '220px' } }, r.onTime.pending.join(' • ')) : null),
           h('td.ro.num', f ? (f.remainingBags ? [h('b', `${fmt.num(f.remainingBags)} ถุง`), h('div.sub', `${fmt.num(f.remainingMt, 1)} ตัน`)] : h('span', { style: { color: 'var(--green)' } }, '✓ ครบ')) : '–'),
           h('td.ro.num', f?.remainingBags ? (f.daysNeeded != null ? h('b', `${f.daysNeeded} วัน`) : h('b', { style: { color: 'var(--red)' } }, 'เกินกำลัง')) : '–'),
           h('td.ro', f?.readyDate && f.remainingBags ? dshort(f.readyDate) : '–'),
