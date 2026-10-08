@@ -372,6 +372,8 @@ table.pgrid td.pc .past .sub { font-size: 10px; font-weight: 400; }
 .grid td.num{text-align:right}
 .inp.load-num{width:100%;max-width:140px;text-align:right;padding:4px 8px}
 
+.modal.wide{width:min(1180px,96vw);max-width:96vw}
+
 </style>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='8' width='26' height='16' rx='2' fill='%231d4ed8'/><path d='M9 11v10M14 11v10M19 11v10M24 11v10' stroke='white' stroke-width='2'/></svg>" />
 </head>
@@ -3184,7 +3186,7 @@ const { parseExportPlan, applyImport } = __require("backend/services/kk/importer
 const { planGrid, planCsv, unitsCsv, shipmentDetail, dailySummary, dashboard } = __require("backend/services/kk/views.js");
 const { XLSX_MIME } = __require("backend/lib/xlsxWrite.js");
 const {
-  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, reconcilePlan, reconcileSite, resetPlanTarget, transfersOf, packDailyRange, carryIn, carryOut,
+  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, reconcilePlan, reconcileSite, forwardPackPlan, resetPlanTarget, transfersOf, packDailyRange, carryIn, carryOut,
 } = __require("backend/services/kk/packing.js");
 
 const kkRouter = Router();
@@ -3553,6 +3555,7 @@ kkRouter.put('/packing/records', (req, res) => {
   res.json(setPackingRecord(req.body, { force: isForce(req) }));
 });
 kkRouter.post('/packing/autoplan', (req, res) => {
+  if (req.body.mode === 'forward') return res.json(forwardPackPlan({ siteCode: req.body.siteCode || 'KK', startDate: req.body.startDate, endDate: req.body.endDate, dryRun: !!req.body.dryRun }));
   res.json(autoPackPlan({ siteCode: req.body.siteCode || 'KK', startDate: req.body.startDate, dryRun: !!req.body.dryRun }));
 });
 kkRouter.post('/packing/rollover', (req, res) => {
@@ -4367,6 +4370,7 @@ Object.defineProperty(__exports, "setPackingRecord", { enumerable: true, get: ()
 Object.defineProperty(__exports, "packGrid", { enumerable: true, get: () => packGrid });
 Object.defineProperty(__exports, "packDaily", { enumerable: true, get: () => packDaily });
 Object.defineProperty(__exports, "autoPackPlan", { enumerable: true, get: () => autoPackPlan });
+Object.defineProperty(__exports, "forwardPackPlan", { enumerable: true, get: () => forwardPackPlan });
 Object.defineProperty(__exports, "rolloverPacking", { enumerable: true, get: () => rolloverPacking });
 Object.defineProperty(__exports, "CSV_HEADER", { enumerable: true, get: () => CSV_HEADER });
 Object.defineProperty(__exports, "parsePackingFile", { enumerable: true, get: () => parsePackingFile });
@@ -4504,11 +4508,12 @@ function rebalanceCarry(shipmentId, depth = 0, moves = []) {
 /**
  * กระทบยอดแผนบรรจุ (ตามสินค้าเดียวกันทุกตัวอักษร)
  * --------------------------------------------------------------
- * เมื่อบรรจุจริงมากกว่า/น้อยกว่าแผน → ปรับแผนวันถัดไปให้พอดีกับถุงที่ยังต้องบรรจุ
- *   1) "ช่องแผน" ของสินค้านี้ = แผนวันนี้เป็นต้นไปที่ยังไม่บันทึกยอดจริง (สาย × วัน × ถุง) รวมทุก Shipment ของสินค้าเดียวกัน
- *   2) เทช่องแผนใหม่ตามลำดับ Shipment (วันโหลดก่อน → หลัง): Shipment แรกครบแล้วจะเริ่ม Shipment ถัดไปได้ทันทีในวันเดียวกัน
- *   3) ถ้าช่องแผนไม่พอ (บรรจุขาด) → ต่อแผนวันทำงานถัดไปบนสายเดิมเท่าที่กำลังสายเหลือ
+ * จัดแผนวันนี้เป็นต้นไปของสินค้าเดียวกันใหม่ ให้พอดีกับ "ถุงที่ยังต้องบรรจุ" ของแต่ละ Shipment
+ *   • เรียง Shipment ตามลำดับที่เริ่มบรรจุจริง/ลงแผนไว้ (ตัวที่เริ่มก่อนบรรจุก่อน) — แผนของ Shipment ไม่ถูกยกให้ตัวอื่นจนกว่าจะครบ
+ *   • บรรจุเต็มกำลังสายทุกวันทำงาน ต่อเนื่องจากวันแรกของแผน: Shipment แรกครบแล้วเริ่มตัวถัดไปได้ทันทีในวันเดียวกัน
+ *   • บรรจุเกิน → แผนข้างหน้าลดลง · บรรจุขาด/ยังไม่ลงแผนครบ → เติมแผนวันถัดไปจนครบจำนวนถุงของ Shipment
  * สินค้าคนละรหัสไม่นำมากระทบยอดกัน · Shipment หลายสินค้า (A + B) กระทบยอดเฉพาะตัวเอง
+ * Shipment ที่ยังไม่เคยลงแผน/บรรจุเลย ไม่ถูกจัดให้อัตโนมัติ (ใช้ "จัดแผนบรรจุอัตโนมัติ" หรือพิมพ์แผนเอง)
  */
 function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
   const s0 = store.get('shipments', shipmentId);
@@ -4521,99 +4526,82 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
   const plannable = (r) => r.actualBags == null && r.date >= today && !r.rolledOver;
   const recs = store.find('packingRecords', (r) => ids.has(r.shipmentId));
   const open = recs.filter((r) => plannable(r) && (r.plannedBags || 0) > 0);
-  // ช่องแผนเดิมเป็นตัน (สินค้าเดียวกันอาจน้ำหนักถุงต่างกันเล็กน้อย)
-  const slotMap = new Map();
-  for (const r of open) {
-    const k = `${r.date}|${r.lineCode}`;
-    const mt = r.plannedBags * mtPerBag(store.get('shipments', r.shipmentId));
-    slotMap.set(k, { date: r.date, lineCode: r.lineCode, mt: (slotMap.get(k)?.mt ?? 0) + mt });
-  }
-  // ช่องแผนต่อวันต้องไม่เกินกำลังสาย (หัก Shipment อื่นที่ไม่ใช่สินค้านี้) — งานที่ทับกันจะเลื่อนไปวันถัดไป
-  const wRef = mtPerBag(s0) || 1;
-  for (const sl of slotMap.values()) {
-    const line = store.findOne('packingLines', (l) => l.code === sl.lineCode && l.siteCode === s0.siteCode);
-    if (!line?.maxBagsPerDay) continue;
-    const other = store.find('packingRecords', (r) => r.lineCode === sl.lineCode && r.date === sl.date && !(ids.has(r.shipmentId) && plannable(r)))
-      .reduce((a, r) => a + effBags(r) * (mtPerBag(store.get('shipments', r.shipmentId)) || wRef), 0);
-    sl.mt = Math.max(0, Math.min(sl.mt, line.maxBagsPerDay * wRef - other));
-  }
-  const slots = [...slotMap.values()].filter((x) => x.mt > 1e-6).sort((a, b) => a.date.localeCompare(b.date) || a.lineCode.localeCompare(b.lineCode));
-  const hadPlan = new Set(open.map((r) => r.shipmentId)); // ต่อแผนเฉพาะ Shipment ที่มีแผนวันข้างหน้าอยู่แล้ว
   const before = new Map(open.map((r) => [`${r.shipmentId}|${r.date}|${r.lineCode}`, r.plannedBags]));
+  const site = siteOf(s0.siteCode);
+  const closed = new Set(site?.closedWeekdays || []);
 
   // ถุงที่ยังต้องบรรจุ = ทั้งหมด − (ยกมาสุทธิ + ตู้ที่โหลดแล้วนอกระบบ + บรรจุจริง + แผนวันที่ผ่านมาที่ยังไม่กรอกยอดจริง)
-  // เป้าแผนข้างหน้า = ไม่เกินที่เคยวางแผนไว้ (แผนรวม − ที่ทำไปแล้ว) → Shipment ที่ลงแผนไว้บางส่วนจะไม่ถูกเติมจนเต็ม
   const remainingOf = (s) => {
     const per = bagsPerCont(s);
     const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * per);
-    const rs = recordsOf(s.id);
-    const done = rs.reduce((a, r) => a + (r.actualBags != null ? r.actualBags : plannable(r) ? 0 : (r.plannedBags || 0)), 0);
-    const need = Math.max(0, Number(s.bags) - openingOf(s) - assumed - done);
-    if (!rs.length) return need; // ยังไม่เคยลงแผน: รับเฉพาะช่องแผนที่ว่างจาก Shipment ก่อนหน้า
-    // ยอดแผนรวมที่ตั้งใจไว้ (จำไว้ที่ Shipment — ไม่ลดลงเมื่อระบบลดแผนเพราะบรรจุเกิน · ล้างเมื่อผู้ใช้แก้แผนเอง)
-    const planSum = rs.reduce((a, r) => a + (r.plannedBags || 0), 0);
-    const intended = Math.max(Number(s.packPlanBags) || 0, planSum);
-    if (intended !== s.packPlanBags) store.update('shipments', s.id, { packPlanBags: intended });
-    return Math.min(need, Math.max(0, intended - done));
+    const done = recordsOf(s.id).reduce((a, r) => a + (r.actualBags != null ? r.actualBags : plannable(r) ? 0 : (r.plannedBags || 0)), 0);
+    return Math.max(0, Number(s.bags) - openingOf(s) - assumed - done);
   };
   const firstLoad = (s) => store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort()[0] ?? '9999';
-  const queue = group.map((s) => ({ s, w: mtPerBag(s), need: remainingOf(s) }))
-    .filter((q) => q.w > 0)
-    .sort((a, b) => firstLoad(a.s).localeCompare(firstLoad(b.s)) || (a.s.closingDate ?? a.s.etd ?? '9999').localeCompare(b.s.closingDate ?? b.s.etd ?? '9999') || a.s.code.localeCompare(b.s.code));
+  const firstRec = (s) => recs.filter((r) => r.shipmentId === s.id && ((r.plannedBags || 0) > 0 || r.actualBags != null)).map((r) => r.date).sort()[0] ?? null;
+  // เฉพาะ Shipment ที่เริ่มบรรจุ/ลงแผนแล้ว — เรียงตามวันที่เริ่ม แล้วตามวันโหลด
+  const queue = group.map((s) => ({ s, w: mtPerBag(s), need: remainingOf(s), start: firstRec(s) }))
+    .filter((q) => q.w > 0 && q.start)
+    .sort((a, b) => a.start.localeCompare(b.start) || firstLoad(a.s).localeCompare(firstLoad(b.s)) || a.s.code.localeCompare(b.s.code));
+  if (!queue.length) return [];
+
+  // สายที่ใช้ = สายของแผนข้างหน้า (ไม่มีก็สายล่าสุดที่บรรจุ / สายของ Shipment)
+  const lineCodes = [...new Set(open.map((r) => r.lineCode))];
+  if (!lineCodes.length) {
+    const last = recs.filter((r) => ids.has(r.shipmentId)).sort((a, b) => b.date.localeCompare(a.date))[0];
+    const l = last?.lineCode ?? lineOfShipment(queue[0].s)?.code;
+    if (l) lineCodes.push(l);
+  }
+  const lines = lineCodes.map((c) => store.findOne('packingLines', (l) => l.code === c && l.siteCode === s0.siteCode)).filter(Boolean)
+    .sort((a, b) => a.code.localeCompare(b.code));
+  // วันเริ่ม = วันแรกของแผนข้างหน้า (ไม่ก่อนวันนี้)
+  let d = open.map((r) => r.date).sort()[0] ?? today;
+  if (d < today) d = today;
+  // วันที่บันทึกยอดจริงแล้ว ถือว่าจบวันนั้น — เริ่มจัดแผนวันถัดจากวันล่าสุดที่มียอดจริง
+  const lastActual = recs.filter((r) => r.actualBags != null).map((r) => r.date).sort().at(-1);
+  if (lastActual && lastActual >= d) d = addDays(lastActual, 1);
 
   const alloc = new Map(); // shipmentId|date|line → bags
-  const add = (q, date, lineCode, bags) => { const k = `${q.s.id}|${date}|${lineCode}`; alloc.set(k, (alloc.get(k) ?? 0) + bags); q.need -= bags; };
-  const EPS = 1e-6;
+  const otherUsed = (lineCode, date) => store.find('packingRecords', (r) => r.lineCode === lineCode && r.date === date && !(ids.has(r.shipmentId) && plannable(r)))
+    .reduce((a, r) => a + effBags(r), 0);
   let qi = 0;
-  for (const sl of slots) {
-    let room = sl.mt;
-    while (qi < queue.length && room > EPS) {
-      const q = queue[qi];
-      if (q.need <= 0) { qi++; continue; }
-      let n = Math.min(q.need, Math.floor(room / q.w + EPS));
-      if (n <= 0) { n = Math.min(q.need, Math.round(room / q.w)); if (n <= 0) break; } // เศษเล็กน้อยปัดเป็นถุง
-      add(q, sl.date, sl.lineCode, n);
-      room -= n * q.w;
+  const unplannable = !lines.some((l) => l.maxBagsPerDay > 0);
+  if (unplannable) return []; // สายยังไม่ตั้งกำลังบรรจุ — ไม่ปรับแผนอัตโนมัติ
+  for (let i = 0; i < 180 && qi < queue.length; i++, d = addDays(d, 1)) {
+    if (closed.has(weekday(d))) continue;
+    for (const line of lines) {
+      if (!(line.maxBagsPerDay > 0)) continue;
+      // ห้องว่างของสายวันนั้น (คิดเป็นตันตามน้ำหนักถุงของสินค้านี้)
+      let roomBags = line.maxBagsPerDay - otherUsed(line.code, d);
+      while (qi < queue.length && roomBags > 0) {
+        const q = queue[qi];
+        if (q.need <= 0) { qi++; continue; }
+        const n = Math.min(q.need, roomBags);
+        const k = `${q.s.id}|${d}|${line.code}`;
+        alloc.set(k, (alloc.get(k) ?? 0) + n);
+        q.need -= n; roomBags -= n;
+      }
     }
   }
-  // บรรจุขาด → ต่อแผนวันทำงานถัดไป (เฉพาะ Shipment ที่มีแผนวันข้างหน้าอยู่แล้ว และสายที่กำหนดกำลังบรรจุ)
-  const site = siteOf(s0.siteCode);
-  const closed = new Set(site?.closedWeekdays || []);
-  for (const q of queue) {
-    if (q.need <= 0 || !hadPlan.has(q.s.id)) continue;
-    const lastSlot = [...alloc.keys()].filter((k) => k.startsWith(`${q.s.id}|`)).map((k) => k.split('|')).sort((a, b) => a[1].localeCompare(b[1])).at(-1);
-    const line = (lastSlot && store.findOne('packingLines', (l) => l.code === lastSlot[2] && l.siteCode === q.s.siteCode)) || lineOfShipment(q.s);
-    if (!line?.maxBagsPerDay) continue;
-    const used = (d) => store.find('packingRecords', (r) => r.lineCode === line.code && r.date === d && !(ids.has(r.shipmentId) && plannable(r)))
-      .reduce((a, r) => a + effBags(r), 0) + [...alloc.entries()].filter(([k]) => k.endsWith(`|${d}|${line.code}`)).reduce((a, [, v]) => a + v, 0);
-    let d = lastSlot ? lastSlot[1] : today;
-    for (let i = 0; i < 90 && q.need > 0; i++, d = addDays(d, 1)) {
-      if (d < today || closed.has(weekday(d))) continue;
-      const room = line.maxBagsPerDay - used(d);
-      if (room > 0) add(q, d, line.code, Math.min(room, q.need));
-    }
-  }
-  // เขียนกลับ: ช่องเดิมที่ไม่ได้ใช้ → 0 (ลบ) · ช่องใหม่ → ตั้งค่า
-  const changes = [];
-  for (const r of open) {
-    const k = `${r.shipmentId}|${r.date}|${r.lineCode}`;
-    if (!alloc.has(k)) upsertRecord(r.shipmentId, r.date, r.lineCode, { plannedBags: 0 });
-  }
+  // เขียนกลับ: ช่องเดิมที่ไม่ได้ใช้ → ลบ · ช่องใหม่ → ตั้งค่า
+  for (const r of open) if (!alloc.has(`${r.shipmentId}|${r.date}|${r.lineCode}`)) upsertRecord(r.shipmentId, r.date, r.lineCode, { plannedBags: 0 });
   for (const [k, bags] of alloc) {
+    if (before.get(k) === bags) continue;
     const [sid, date, lineCode] = k.split('|');
-    if (before.get(k) !== bags) upsertRecord(sid, date, lineCode, { plannedBags: bags });
+    upsertRecord(sid, date, lineCode, { plannedBags: bags });
   }
-  for (const s of group) {
-    const w = mtPerBag(s);
-    const old = open.filter((r) => r.shipmentId === s.id).reduce((a, r) => a + r.plannedBags, 0);
-    const nw = [...alloc.entries()].filter(([k]) => k.startsWith(`${s.id}|`)).reduce((a, [, v]) => a + v, 0);
-    const moved = [...alloc.entries()].some(([k, v]) => k.startsWith(`${s.id}|`) && before.get(k) !== v) || open.some((r) => r.shipmentId === s.id && !alloc.has(`${s.id}|${r.date}|${r.lineCode}`));
+  const changes = [];
+  for (const q of queue) {
+    const { s, w } = q;
+    const mine = (k) => k.startsWith(`${s.id}|`);
+    const moved = [...alloc.entries()].some(([k, v]) => mine(k) && before.get(k) !== v) || open.some((r) => r.shipmentId === s.id && !alloc.has(`${s.id}|${r.date}|${r.lineCode}`));
     if (!moved) continue;
-    const dates = [...alloc.keys()].filter((k) => k.startsWith(`${s.id}|`)).map((k) => k.split('|')[1]).sort();
+    const old = open.filter((r) => r.shipmentId === s.id).reduce((a, r) => a + r.plannedBags, 0);
+    const nw = [...alloc.entries()].filter(([k]) => mine(k)).reduce((a, [, v]) => a + v, 0);
+    const dates = [...alloc.keys()].filter(mine).map((k) => k.split('|')[1]).sort();
     changes.push({ type: 'replan', code: s.code, product: s.product, fromMt: round(old * w, 2), toMt: round(nw * w, 2), from: dates[0] ?? null, to: dates.at(-1) ?? null });
   }
-  const left = queue.filter((q) => q.need > 0 && hadPlan.has(q.s.id));
-  for (const q of left) changes.push({ type: 'unplanned', code: q.s.code, product: q.s.product, mt: round(q.need * q.w, 2) });
+  for (const q of queue.filter((x) => x.need > 0)) changes.push({ type: 'unplanned', code: q.s.code, product: q.s.product, mt: round(q.need * q.w, 2) });
   return changes;
 }
 
@@ -5048,6 +5036,143 @@ function autoPackPlan({ siteCode = 'KK', startDate, dryRun = false } = {}) {
         bagsUnmet: results.reduce((a, r) => a + r.unmet, 0),
       },
       results, issues,
+    };
+  };
+  return dryRun ? store.simulate(run) : store.transaction(run);
+}
+
+/**
+ * จัดแผนบรรจุแบบ "เดินเต็มกำลังสาย" ตามช่วงวันที่
+ * --------------------------------------------------------------
+ * เริ่มวัน startDate บรรจุเต็มกำลังสายทุกวันทำงาน ต่อเนื่องจนครบทุก Shipment ที่ยังบรรจุไม่ครบ
+ * แล้วบอกว่า "ถ้าเดินเต็มแผน จะเสร็จวันไหน" เทียบกับวันที่ต้องการให้เสร็จ (endDate) และวันโหลดตู้ของแต่ละ Shipment
+ *   • สายของ Shipment = สายที่เคยบรรจุ/ลงแผน → สายของสินค้าเดียวกัน → สายที่กำหนดใน Shipment → สายที่งานน้อยสุด
+ *   • ลำดับในสาย = ตัวที่เริ่มบรรจุแล้วก่อน แล้วตามวันโหลด (โหลดก่อนบรรจุก่อน)
+ *   • แผนเดิมตั้งแต่ startDate ที่ยังไม่มียอดจริงจะถูกแทนที่ · ยอดจริงที่บันทึกแล้วไม่ถูกแตะ
+ */
+function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false } = {}) {
+  const site = siteOf(siteCode);
+  if (!site) throw notFound(`หน้างาน ${siteCode}`);
+  const today = todayISO();
+  let start = startDate || today;
+  if (!isISODate(start)) throw badRequest('วันที่เริ่มไม่ถูกต้อง');
+  if (start < today) start = today;
+  const end = endDate || null;
+  if (end && (!isISODate(end) || end < start)) throw badRequest('วันที่ต้องการให้เสร็จ ต้องไม่ก่อนวันที่เริ่ม');
+  const lead = Number(site.packLeadDays ?? 0);
+  const closed = new Set(site.closedWeekdays || []);
+  const isWork = (d) => !closed.has(weekday(d));
+  const workdays = (a, b) => { let n = 0; for (let d = a; d <= b; d = addDays(d, 1)) if (isWork(d)) n++; return n; };
+
+  const run = () => {
+    const lines = linesOf(site.code).filter((l) => l.maxBagsPerDay > 0);
+    if (!lines.length) throw badRequest('ยังไม่ได้ตั้งกำลังบรรจุ (ถุง/วัน) ของสายบรรจุ — ตั้งที่ตารางสายบรรจุก่อน');
+    const lineSet = new Set(lines.map((l) => l.code));
+    const replace = (r) => r.actualBags == null && r.date >= start && !r.rolledOver;
+    const ships = store.find('shipments', (x) => x.siteCode === site.code && needsPacking(x));
+    const idsAll = new Set(ships.map((x) => x.id));
+    const allRecs = store.find('packingRecords', (r) => idsAll.has(r.shipmentId));
+    const recsOf = (id) => allRecs.filter((r) => r.shipmentId === id);
+    const remainingOf = (s) => {
+      const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * bagsPerCont(s));
+      const done = recsOf(s.id).reduce((a, r) => a + (r.actualBags != null ? r.actualBags : replace(r) ? 0 : (r.plannedBags || 0)), 0);
+      return Math.max(0, Number(s.bags) - openingOf(s) - assumed - done);
+    };
+    const loadsOf = (s) => store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort();
+    const items = ships.map((s) => {
+      const rs = recsOf(s.id).filter((r) => (r.plannedBags || 0) > 0 || r.actualBags != null);
+      return { s, w: mtPerBag(s), need: remainingOf(s), loads: loadsOf(s), started: rs.map((r) => r.date).sort()[0] ?? null,
+        lastLine: rs.sort((a, b) => b.date.localeCompare(a.date)).find((r) => lineSet.has(r.lineCode))?.lineCode ?? null };
+    }).filter((it) => it.need > 0);
+
+    // เลือกสาย
+    const workOn = Object.fromEntries(lines.map((l) => [l.code, 0]));
+    const prodLine = (it) => {
+      const key = prodKey(it.s);
+      if (!key) return null;
+      return allRecs.filter((r) => lineSet.has(r.lineCode) && prodKey(store.get('shipments', r.shipmentId)) === key).sort((a, b) => b.date.localeCompare(a.date))[0]?.lineCode ?? null;
+    };
+    const order = (a, b) => (a.started ? 0 : 1) - (b.started ? 0 : 1) || (a.started ?? '').localeCompare(b.started ?? '')
+      || (a.loads[0] ?? '9999').localeCompare(b.loads[0] ?? '9999') || a.s.code.localeCompare(b.s.code);
+    items.sort(order);
+    const assigned = new Map(); // สินค้าเดียวกันในรอบนี้ → สายเดียวกัน (บรรจุต่อเนื่องกัน)
+    for (const it of items) {
+      const key = prodKey(it.s);
+      it.line = it.lastLine || prodLine(it) || (key && assigned.get(key)) || (lineSet.has(it.s.packLine) ? it.s.packLine : null)
+        || lines.map((l) => l.code).sort((a, b) => workOn[a] / lines.find((l) => l.code === a).maxBagsPerDay - workOn[b] / lines.find((l) => l.code === b).maxBagsPerDay)[0];
+      workOn[it.line] += it.need;
+      if (key && !assigned.has(key)) assigned.set(key, it.line);
+    }
+    // จำลองรายวัน เต็มกำลังสาย
+    const otherUsed = (lineCode, d) => store.find('packingRecords', (r) => r.lineCode === lineCode && r.date === d && !(idsAll.has(r.shipmentId) && replace(r)))
+      .reduce((a, r) => a + effBags(r), 0);
+    const alloc = new Map();
+    const lineStat = {};
+    for (const L of lines) {
+      const q = items.filter((it) => it.line === L.code);
+      const st = lineStat[L.code] = { code: L.code, name: L.name, cap: L.maxBagsPerDay, bags: 0, mt: 0, mtInRange: 0, days: 0, first: null, finish: null, shipments: q.length };
+      let qi = 0;
+      for (let d = start, i = 0; qi < q.length && i < 730; d = addDays(d, 1), i++) {
+        if (!isWork(d)) continue;
+        let room = L.maxBagsPerDay - otherUsed(L.code, d);
+        let used = false;
+        while (qi < q.length && room > 0) {
+          const it = q[qi];
+          if (it.need <= 0) { qi++; continue; }
+          const ex = findRecord(it.s.id, d, L.code);
+          if (ex && !replace(ex)) break; // วันนั้นบันทึกยอดจริงของ Shipment นี้แล้ว — ไปวันถัดไป
+          const n = Math.min(it.need, room);
+          const k = `${it.s.id}|${d}|${L.code}`;
+          alloc.set(k, (alloc.get(k) ?? 0) + n);
+          it.need -= n; room -= n; used = true;
+          it.first ??= d; it.finish = d;
+          it.mtInRange = (it.mtInRange ?? 0) + (!end || d <= end ? n * it.w : 0);
+          st.bags += n; st.mt += n * it.w; if (!end || d <= end) st.mtInRange += n * it.w;
+        }
+        if (used) { st.days += 1; st.first ??= d; st.finish = d; }
+      }
+    }
+    // บันทึก: แทนที่แผนเดิมตั้งแต่วันเริ่ม
+    const touched = new Set(items.map((it) => it.s.id));
+    for (const r of allRecs) if (touched.has(r.shipmentId) && replace(r) && (r.plannedBags || 0) > 0 && !alloc.has(`${r.shipmentId}|${r.date}|${r.lineCode}`)) upsertRecord(r.shipmentId, r.date, r.lineCode, { plannedBags: 0 });
+    for (const [k, bags] of alloc) { const [sid, d, lc] = k.split('|'); upsertRecord(sid, d, lc, { plannedBags: bags }); }
+
+    const results = items.map((it) => {
+      const total = [...alloc.entries()].filter(([k]) => k.startsWith(`${it.s.id}|`)).reduce((a, [, v]) => a + v, 0);
+      const nextLoad = it.loads[0] ?? null;
+      const deadline = nextLoad ? addDays(nextLoad, -lead) : null;
+      const lastLoad = it.loads.at(-1) ?? null;
+      const finishOk = it.finish && it.need <= 0;
+      return {
+        shipmentId: it.s.id, code: it.s.code, customerName: it.s.customerName, product: it.s.product, line: it.line,
+        bags: total, mt: round(total * it.w, 2), mtInRange: round(it.mtInRange ?? 0, 2), mtAfterEnd: round(total * it.w - (it.mtInRange ?? 0), 2),
+        start: it.first ?? null, finish: finishOk ? it.finish : null, workDays: it.first && it.finish ? workdays(it.first, it.finish) : 0,
+        nextLoad, lastLoad,
+        loadOk: !lastLoad ? null : finishOk && it.finish <= addDays(lastLoad, -lead),
+        // เผื่อกี่วัน: วันบรรจุเสร็จทั้ง Shipment เทียบกับวันโหลดตู้สุดท้าย (− lead)
+        slack: finishOk && lastLoad ? dayDiff(it.finish, addDays(lastLoad, -lead)) : null,
+        deadline, meetsTarget: end ? !!finishOk && it.finish <= end : null,
+        allocations: [...alloc.entries()].filter(([k]) => k.startsWith(`${it.s.id}|`)).map(([k, v]) => ({ date: k.split('|')[1], line: k.split('|')[2], bags: v, mt: round(v * it.w, 2) })).sort((a, b) => a.date.localeCompare(b.date)),
+      };
+    }).sort((a, b) => (a.start ?? '9999').localeCompare(b.start ?? '9999') || a.code.localeCompare(b.code));
+    const finishAll = results.reduce((m, r) => (r.finish && r.finish > m ? r.finish : m), '') || null;
+    const unfinished = results.filter((r) => !r.finish).length;
+    return {
+      dryRun, startDate: start, endDate: end,
+      summary: {
+        shipments: results.length,
+        mt: round(results.reduce((a, r) => a + r.mt, 0), 2),
+        mtInRange: round(results.reduce((a, r) => a + r.mtInRange, 0), 2),
+        finishAll, unfinished,
+        workDays: finishAll ? workdays(start, finishAll) : null,
+        rangeWorkDays: end ? workdays(start, end) : null,
+        meetsTarget: end ? !unfinished && !!finishAll && finishAll <= end : null,
+        lateDays: end && finishAll && finishAll > end ? workdays(addDays(end, 1), finishAll) : 0,
+        lateLoads: results.filter((r) => r.loadOk === false).length,
+      },
+      lines: Object.values(lineStat).map((x) => ({ ...x, mt: round(x.mt, 2), mtInRange: round(x.mtInRange, 2),
+        meetsTarget: end ? !x.finish || x.finish <= end : null })),
+      results,
     };
   };
   return dryRun ? store.simulate(run) : store.transaction(run);
@@ -6952,10 +7077,10 @@ function renderIssues(issues = [], { empty = null } = {}) {
 }
 
 /** Modal: คืน { close, el } ; actions = [{label, cls, onClick(close)}] */
-function modal({ title, body, actions = [], narrow = false, onClose }) {
+function modal({ title, body, actions = [], narrow = false, wide = false, onClose }) {
   const close = () => { back.remove(); onClose?.(); };
   const back = h('div.modal-back', { onclick: (e) => { if (e.target === back) close(); } },
-    h(`div.modal${narrow ? '.narrow' : ''}`, { role: 'dialog', 'aria-modal': 'true' },
+    h(`div.modal${narrow ? '.narrow' : ''}${wide ? '.wide' : ''}`, { role: 'dialog', 'aria-modal': 'true' },
       h('div.modal-head', h('h3', title), h('button.x', { type: 'button', onclick: close, 'aria-label': 'ปิด' }, '×')),
       h('div.modal-body', body),
       actions.length ? h('div.modal-foot', actions.map((a) =>
@@ -8318,7 +8443,7 @@ const FIELDS = [
   ['closingDate', 'Closing date', 'date'], ['closingTime', 'Closing time', 'time'],
   ['firstReturnDate', 'First Return date', 'date'], ['firstReturnTime', 'First Return time', 'time'],
   ['bagType', 'Bag', 'pack-bag'], ['palletType', 'Pallet', 'pack-pallet'],
-  ['packOpening', 'ถุงที่บรรจุไว้แล้ว (ยกมา)', 'number'],
+  ['packOpening', 'ตันที่บรรจุไว้แล้ว (ยกมา)', 'number'],
   ['specialRequest', 'Special request', 'text'], ['podPort', 'POD port', 'text'], ['remark', 'Remark (คำสั่งพิเศษหน้างาน)', 'textarea'],
 ];
 
@@ -8341,6 +8466,12 @@ function shipmentForm(s, kkMeta) {
     } else if (type === 'textarea') el = h('textarea.inp', { rows: 2 }, s[key] ?? '');
     else el = h('input.inp', { type, value: s[key] ?? '', step: key === 'mt' || key === 'packingMtPerBag' ? '0.01' : type === 'number' ? '1' : null, min: type === 'number' ? 0 : null, placeholder: key === 'mt' ? 'เช่น 504.25' : key === 'packingMtPerBag' ? 'เช่น 1.20' : null });
     if (key === 'packingMtPerBag' && s[key]) el.value = Number(s[key]).toFixed(2);
+    if (key === 'packOpening') { // กรอกเป็นตัน (ทศนิยม 2) — เก็บเป็นถุงเต็ม = ตัน ÷ น้ำหนักต่อถุง
+      el.step = '0.01';
+      el.placeholder = 'เช่น 13.20';
+      const w0 = s.packingMtPerBag > 0 ? Number(s.packingMtPerBag) : s.mt > 0 && s.bags > 0 ? s.mt / s.bags : 0;
+      el.value = s.packOpening ? (w0 ? (s.packOpening * w0).toFixed(2) : s.packOpening) : '';
+    }
     inputs[key] = el;
     grid.append(field(label, el));
     if (type === 'textarea') grid.lastChild.style.gridColumn = '1 / -1';
@@ -8350,6 +8481,10 @@ function shipmentForm(s, kkMeta) {
     for (const [key, , type] of FIELDS) {
       const v = inputs[key].value;
       if (type === 'number') out[key] = v === '' ? null : key === 'mt' || key === 'packingMtPerBag' ? Math.round(Number(v) * 100) / 100 : Number(v);
+      if (key === 'packOpening') {
+        const w = Number(inputs.packingMtPerBag.value) || (Number(inputs.mt.value) > 0 && Number(inputs.bags.value) > 0 ? Number(inputs.mt.value) / Number(inputs.bags.value) : 0);
+        out[key] = v === '' ? 0 : w ? Math.round(Number(v) / w) : Math.round(Number(v));
+      }
       else if (type === 'date' || type === 'time' || type === 'pack-line') out[key] = v || null;
       else out[key] = v;
     }
@@ -9553,7 +9688,7 @@ async function openLineDay(l, date, lines, site, rerender) {
 function mainTable(g, site, rerender) {
   const lineOpts = g.lines.map((l) => ({ value: l.code, label: l.code }));
   const head = h('tr',
-    h('th.sticky-col', 'Shipment'), h('th', 'สินค้า / Bag'), h('th', 'Loading ถัดไป'), h('th', 'สาย'), h('th.num', 'ตันทั้งหมด'), h('th.num', 'ถุงยกมา'), h('th', 'บรรจุจริง / ลงแผน (ตัน)'),
+    h('th.sticky-col', 'Shipment'), h('th', 'สินค้า / Bag'), h('th', 'Loading ถัดไป'), h('th', 'สาย'), h('th.num', 'ตันทั้งหมด'), h('th.num', 'ยกมา (ตัน)'), h('th', 'บรรจุจริง / ลงแผน (ตัน)'),
     g.dates.map((d) => dayHead(d, g.today)));
   const totalRow = h('tr.total',
     h('td.sticky-col', h('b', 'รวมตัน/วัน'), h('div.sub', 'บรรจุจริง / แผน (ตัน)')),
@@ -9590,12 +9725,20 @@ function mainTable(g, site, rerender) {
       },
     })));
     tr.append(h('td.num', h('b', fmt.num(r.mt, 2)), h('div.sub', `${fmt.num(r.bags)} ถุง`)));
-    const op = h('input.inp', { type: 'number', min: 0, step: 1, value: r.packOpening || '', placeholder: '0', style: { width: '76px', textAlign: 'right' } });
+    // ยกมา: กรอกเป็นตัน (ทศนิยม 2 ตำแหน่ง) → เก็บเป็นถุงเต็ม = ตัน ÷ น้ำหนักต่อถุง
+    const op = h('input.inp', { type: 'number', min: 0, step: w ? '0.01' : 1, value: r.packOpening ? (w ? (r.packOpening * w).toFixed(2) : r.packOpening) : '', placeholder: w ? '0.00' : '0', title: w ? 'กรอกเป็นตัน' : 'ยังไม่มีน้ำหนักต่อถุง — กรอกเป็นถุง', style: { width: '90px', textAlign: 'right' } });
     op.addEventListener('change', async () => {
-      try { await api.patch(`/kk/shipments/${r.id}`, { packOpening: op.value === '' ? 0 : Number(op.value), force: true }); rerender(); } catch (err) { toast(err.message, 'error'); }
+      const v = op.value === '' ? 0 : Number(op.value);
+      if (!(v >= 0)) return toast('กรอกตัวเลข ≥ 0', 'warn');
+      const bags = w ? Math.round(v / w) : Math.round(v);
+      try {
+        await api.patch(`/kk/shipments/${r.id}`, { packOpening: bags, force: true });
+        if (w && Math.abs(bags * w - v) > 0.005) toast(`ปัดเป็นถุงเต็ม: ${fmt.num(v, 2)} ตัน → ${bags} ถุง = ${fmt.num(bags * w, 2)} ตัน`, 'warn', 4000);
+        rerender();
+      } catch (err) { toast(err.message, 'error'); }
     });
     tr.append(h('td.num', op,
-      r.packOpening && w ? h('div.sub', `= ${T(r.packOpening)} ตัน`) : null,
+      r.packOpening ? h('div.sub', w ? `= ${fmt.num(r.packOpening)} ถุง` : 'ถุง (ยังไม่มีน้ำหนักต่อถุง)') : null,
       r.carryIn ? h('div.sub', { style: { color: 'var(--green)' } }, `+${T(r.carryIn)} ตัน รับยก`) : null,
       r.carryOut ? h('div.sub', { style: { color: 'var(--primary)' } }, `−${T(r.carryOut)} ตัน ยกออก`) : null));
     tr.append(h('td.nowrap', h('div', `${T(rd.packedActual)} / ${T(rd.plannedOrPacked)}`),
@@ -9691,43 +9834,80 @@ function packImportReport(r) {
     !r.errors.length && !r.issues?.length ? h('div.issue.info', h('span.ic', '✓'), 'ข้อมูลถูกต้อง พร้อมนำเข้า') : null);
 }
 
-// ---------- จัดแผนบรรจุอัตโนมัติ ----------
+// ---------- จัดแผนบรรจุอัตโนมัติ (เดินเต็มกำลังสาย ตามช่วงวันที่) ----------
 function openAutoPack(site, kkMeta, rerender) {
-  const start = h('input.inp', { type: 'date', value: kkMeta.today });
-  const out = h('div.muted', 'จัดเฉพาะถุงที่ยังขาดสำหรับวันโหลดตู้: วางในวันโหลด (หรือก่อนหน้าตามที่ตั้งไว้) แล้วถอยหลังทีละวัน ไม่เกินกำลังบรรจุของสาย และข้ามวันหยุดหน้างาน');
+  const today = kkMeta.today;
+  const monthEnd = (() => { const [y, m] = today.split('-').map(Number); const d = new Date(Date.UTC(y, m, 0)); return d.toISOString().slice(0, 10); })();
+  const start = h('input.inp', { type: 'date', value: today, min: today });
+  const end = h('input.inp', { type: 'date', value: monthEnd, min: today });
+  const d = (iso) => (iso ? fmt.date(iso, { day: 'numeric', month: 'short' }) : '–');
+  const dl = (iso) => (iso ? fmt.dateLong(iso) : '–');
+  const out = h('div.muted', 'เลือกวันที่เริ่ม และวันที่ต้องการให้บรรจุเสร็จ แล้วกด "คำนวณ" — ระบบเดินเต็มกำลังสายทุกวันทำงาน (ข้ามวันหยุดหน้างาน) จนครบทุก Shipment แล้วบอกว่าจะเสร็จวันไหน');
   let previewed = false;
+  const yesNo = (v, okTxt = 'ทัน', ngTxt = 'ไม่ทัน') => (v == null ? '–' : badge(v ? `✓ ${okTxt}` : `✗ ${ngTxt}`, v ? 'green' : 'red'));
+  const draw = (r) => {
+    const sm = r.summary;
+    const head = !sm.shipments
+      ? h('div.issue.info', h('span.ic', 'i'), 'ไม่มี Shipment ที่ยังต้องบรรจุ — ทุก Shipment บรรจุครบแล้ว')
+      : h('div', { style: { display: 'grid', gap: '10px' } },
+        h(`div.issue.${sm.meetsTarget === false ? 'warn' : 'info'}`, { style: { fontSize: '15px' } }, h('span.ic', sm.meetsTarget === false ? '!' : '✓'),
+          h('div',
+            h('div', 'ถ้าเดินเต็มกำลังสายตั้งแต่ ', h('b', dl(r.startDate)), ' งานทั้งหมด ', h('b', `${fmt.num(sm.mt, 2)} ตัน`), ' (', fmt.num(sm.shipments), ' Shipment)'),
+            h('div', { style: { fontSize: '18px', marginTop: '4px' } }, 'จะบรรจุเสร็จวันที่ ', h('b', sm.finishAll ? dl(sm.finishAll) : 'เกินกว่า 2 ปี'), sm.workDays ? ` · ใช้ ${sm.workDays} วันทำงาน` : ''),
+            r.endDate ? h('div', { style: { marginTop: '4px' } },
+              `วันที่ต้องการให้เสร็จ ${dl(r.endDate)} (${sm.rangeWorkDays} วันทำงาน) → `,
+              sm.meetsTarget ? badge('✓ ทันตามที่ต้องการ', 'green') : badge(`✗ เกินไป ${sm.lateDays} วันทำงาน`, 'red'),
+              ` · ภายในช่วงนี้บรรจุได้ ${fmt.num(sm.mtInRange, 2)} ตัน`, sm.meetsTarget ? '' : ` เหลือ ${fmt.num(sm.mt - sm.mtInRange, 2)} ตัน`) : null,
+            sm.lateLoads ? h('div', { style: { color: 'var(--red)', marginTop: '4px' } }, `⚠ ${sm.lateLoads} Shipment บรรจุไม่ทันวันโหลดตู้`) : null)),
+        h('div.card', h('div.card-head', h('h2', 'แยกตามสายบรรจุ')), h('div.grid-wrap', h('table.grid',
+          h('thead', h('tr', ['สาย', 'กำลังสาย', 'Shipment', 'งาน (ตัน)', 'เริ่ม', 'เสร็จ', 'วันทำงาน', 'ทันวันที่ต้องการ'].map((t) => h('th', t)))),
+          h('tbody', r.lines.map((l) => h('tr',
+            h('td.ro', h('b', l.code), h('div.sub', l.name || '')), h('td.ro.num', `${fmt.num(l.cap)} ถุง/วัน`), h('td.ro.num', fmt.num(l.shipments)),
+            h('td.ro.num', h('b', fmt.num(l.mt, 2))), h('td.ro', d(l.first)), h('td.ro', h('b', d(l.finish))), h('td.ro.num', l.days || '–'),
+            h('td.ro', l.shipments ? yesNo(l.meetsTarget) : h('span.sub', 'ว่าง')))))))),
+        h('div.card', h('div.card-head', h('h2', 'แยกตาม Shipment'), h('span.hint', 'เรียงตามลำดับบรรจุ · ทันโหลด = บรรจุครบก่อนวันโหลดตู้สุดท้าย')), h('div.grid-wrap', { style: { maxHeight: '320px' } }, h('table.grid',
+          h('thead', h('tr', ['Shipment', 'สินค้า', 'สาย', 'ต้องบรรจุ (ตัน)', 'ในช่วงที่เลือก', 'เริ่ม – เสร็จ', 'Loading', 'ทันโหลด?', 'ทันวันที่ต้องการ?'].map((t) => h('th', t)))),
+          h('tbody', r.results.map((x) => h(`tr${x.loadOk === false ? '.row-red' : x.meetsTarget === false ? '.row-yellow' : ''}`,
+            h('td.ro', h('b.mono', x.code), h('div.sub', x.customerName || '')),
+            h('td.ro', x.product || '-'), h('td.ro', x.line),
+            h('td.ro.num', h('b', fmt.num(x.mt, 2))),
+            h('td.ro.num', fmt.num(x.mtInRange, 2), x.mtAfterEnd > 0.005 ? h('div.sub', { style: { color: 'var(--red)' } }, `หลังวันที่ต้องการ ${fmt.num(x.mtAfterEnd, 2)}`) : null),
+            h('td.ro', `${d(x.start)} – `, h('b', d(x.finish)), h('div.sub', `${x.workDays} วันทำงาน`)),
+            h('td.ro', x.lastLoad ? h('b', d(x.lastLoad)) : h('span.sub', 'ยังไม่มีวันโหลด'), x.nextLoad && x.nextLoad !== x.lastLoad ? h('div.sub', `เริ่มโหลด ${d(x.nextLoad)}`) : null),
+            h('td.ro', x.loadOk == null ? '–' : x.loadOk ? badge(`✓ เผื่อ ${x.slack} วัน`, 'green') : badge(`✗ ช้า ${Math.abs(x.slack ?? 0)} วัน`, 'red')),
+            h('td.ro', yesNo(x.meetsTarget)))))))));
+    out.replaceChildren(head);
+  };
   const run = async (dryRun, close) => {
+    if (!start.value) return toast('เลือกวันที่เริ่ม', 'warn');
+    if (end.value && end.value < start.value) return toast('วันที่ต้องการให้เสร็จ ต้องไม่ก่อนวันที่เริ่ม', 'warn');
     try {
-      const r = await api.post('/kk/packing/autoplan', { siteCode: site.code, startDate: start.value, dryRun });
-      if (dryRun) {
-        previewed = true;
-        out.replaceChildren(r.results.length ? h('div', { style: { display: 'grid', gap: '10px' } },
-          h('div.stat-row', h('span', 'Shipment ', h('b', r.summary.shipments)), h('span', 'ลงแผนบรรจุ ', h('b', fmt.num(r.summary.bagsPlanned)), ' ถุง'),
-            h('span', 'จัดไม่ได้ ', h('b', { style: { color: r.summary.bagsUnmet ? 'var(--red)' : null } }, fmt.num(r.summary.bagsUnmet)), ' ถุง')),
-          renderIssues(r.issues),
-          h('div.card', h('div.grid-wrap', h('table.grid',
-            h('thead', h('tr', ['Shipment', 'สาย', 'แผนบรรจุ (วันที่ · ถุง)', 'หมายเหตุ'].map((t) => h('th', t)))),
-            h('tbody', r.results.map((x) => h(`tr${x.unmet ? '.row-red' : ''}`,
-              h('td.ro', h('b', x.code), h('div.sub', x.customerName || '')), h('td.ro', x.line || '-'),
-              h('td.ro.alloc.wrap', x.allocations.map((a) => h('span', `${fmt.date(a.date, { day: 'numeric', month: 'short' })} · ${fmt.num(a.bags)}`))),
-              h('td.ro.wrap', { style: { fontSize: '12px' } }, x.notes.join(' • ') || '—')))))))) :
-          h('div.issue.info', h('span.ic', 'i'), 'ทุก Shipment มีถุงพอสำหรับวันโหลดตู้แล้ว — ไม่มีอะไรต้องจัดเพิ่ม'));
-        return;
-      }
+      const r = await api.post('/kk/packing/autoplan', { siteCode: site.code, mode: 'forward', startDate: start.value, endDate: end.value || null, dryRun });
+      if (dryRun) { previewed = true; draw(r); return; }
       close();
-      toast(`ลงแผนบรรจุ ${fmt.num(r.summary.bagsPlanned)} ถุง`, 'success', 5000);
+      toast(`บันทึกแผนบรรจุ ${fmt.num(r.summary.mt, 2)} ตัน · เสร็จ ${dl(r.summary.finishAll)}`, 'success', 6000);
       rerender();
     } catch (e) { toast(e.message, 'error', 6000); }
   };
+  const quick = (label, days) => h('button.btn.small', { type: 'button', onclick: () => { end.value = addDays(start.value || today, days); run(true); } }, label);
+  [start, end].forEach((x) => x.addEventListener('change', () => { previewed = false; }));
   modal({
-    title: `จัดแผนบรรจุถุงอัตโนมัติ — ${site.code}`,
-    body: [h('div.form-grid', field('เริ่มตั้งแต่วันที่', start)), out],
+    title: `จัดแผนบรรจุอัตโนมัติ (เดินเต็มกำลังสาย) — ${site.code}`,
+    wide: true,
+    body: [
+      h('div.form-grid', field('วันที่เริ่มบรรจุ', start), field('วันที่ต้องการให้เสร็จ', end)),
+      h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '6px 0 10px' } }, h('span.sub', 'ช่วงลัด:'),
+        quick('7 วัน', 6), quick('14 วัน', 13), quick('30 วัน', 29),
+        h('button.btn.small', { type: 'button', onclick: () => { end.value = monthEnd; run(true); } }, 'ถึงสิ้นเดือน')),
+      h('div.sub', { style: { marginBottom: '10px' } }, 'แผนเดิมตั้งแต่วันที่เริ่มที่ยังไม่มียอดจริงจะถูกแทนที่ · ยอดบรรจุจริงที่บันทึกแล้วไม่ถูกแตะ · แต่ละ Shipment บรรจุในสายเดิมที่เคยบรรจุ / สายของสินค้าเดียวกัน'),
+      out],
     actions: [
       { label: 'ปิด', onClick: (c) => c() },
       { label: 'คำนวณ (ดูตัวอย่าง)', onClick: () => run(true) },
       { label: 'ยืนยันบันทึกแผน', cls: 'primary', onClick: (c) => (previewed ? run(false, c) : run(true)) },
     ],
   });
+  run(true);
 }
 
 function debounce(fn, ms) {
