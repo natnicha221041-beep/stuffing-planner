@@ -4384,6 +4384,7 @@ Object.defineProperty(__exports, "applyPackingImport", { enumerable: true, get: 
 Object.defineProperty(__exports, "packingCsv", { enumerable: true, get: () => packingCsv });
 Object.defineProperty(__exports, "lineRate", { enumerable: true, get: () => lineRate });
 Object.defineProperty(__exports, "packForecast", { enumerable: true, get: () => packForecast });
+Object.defineProperty(__exports, "lineLedger", { enumerable: true, get: () => lineLedger });
 Object.defineProperty(__exports, "XLSX_HEADER", { enumerable: true, get: () => XLSX_HEADER });
 Object.defineProperty(__exports, "packingWorkbook", { enumerable: true, get: () => packingWorkbook });
 Object.defineProperty(__exports, "packingReport", { enumerable: true, get: () => packingReport });
@@ -4402,7 +4403,7 @@ Object.defineProperty(__exports, "packDailyRange", { enumerable: true, get: () =
 const { store } = __require("backend/db/store.js");
 const { todayISO, addDays, isISODate, dateRange } = __require("backend/utils/date.js");
 const { badRequest, notFound, ValidationBlockedError } = __require("backend/utils/errors.js");
-const { siteOf, unitsOf, bagsPerCont, round, planMt } = __require("backend/services/kk/core.js");
+const { siteOf, unitsOf, bagsPerCont, round, planMt, containerTracking } = __require("backend/services/kk/core.js");
 const { readWorkbook, isDateSerial, serialToISO, colToNum } = __require("backend/lib/xlsx.js");
 const { buildXlsx } = __require("backend/lib/xlsxWrite.js");
 
@@ -5633,6 +5634,58 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
   };
 }
 
+/**
+ * บัญชีงานต่อสาย (กระทบยอดสิ่งที่โหลดออกไปแล้ว)
+ * --------------------------------------------------------------
+ * ต่อ Shipment: บรรจุแล้ว (ยกมา + ยอดจริง) · โหลดออกแล้ว (ตู้ที่โหลดแล้ว / Loading date ผ่านมาแล้ว) · คงคลังรอโหลด = บรรจุแล้ว − โหลดออก
+ * แบ่งเข้าสายตามสัดส่วนยอดบรรจุจริงของแต่ละสาย (ยังไม่เคยบรรจุ = สายตามแผน / สายของ Shipment)
+ * Shipment ที่บรรจุครบและโหลดออกครบแล้ว → ออกจากงานของสาย (นับเฉพาะ "โหลดออกแล้วในช่วงวันที่")
+ */
+function lineLedger(siteCode, { from = null, to = null, today = todayISO() } = {}) {
+  const lines = linesOf(siteCode);
+  const L = Object.fromEntries(lines.map((l) => [l.code, { code: l.code, stockMt: 0, packedOpenMt: 0, shippedOpenMt: 0, shippedRangeMt: 0, openShipments: 0, closedShipments: 0, needMt: 0 }]));
+  const tracking = containerTracking();
+  for (const s of store.find('shipments', (x) => x.siteCode === siteCode && x.status !== 'cancelled' && Number(x.bags) > 0)) {
+    const w = mtPerBag(s);
+    if (!(w > 0)) continue;
+    const recs = recordsOf(s.id);
+    const units = unitsOf(s.id);
+    const isLoaded = (u) => u.status === 'loaded' || (!tracking && !u.assumed && u.planDate && u.planDate < today);
+    const f = unitBagsFn(s);
+    const loadedUnits = units.filter(isLoaded);
+    const shippedBags = Math.round(loadedUnits.reduce((a, u) => a + (u.assumed ? bagsPerCont(s) : f(u)), 0));
+    const actualByLine = {};
+    for (const r of recs) if (r.actualBags != null && L[r.lineCode]) actualByLine[r.lineCode] = (actualByLine[r.lineCode] ?? 0) + r.actualBags;
+    const actualSum = Object.values(actualByLine).reduce((a, b) => a + b, 0);
+    const opening = Math.max(0, openingOf(s)) + Math.round(units.filter((u) => u.assumed && u.status === 'loaded').length * bagsPerCont(s));
+    const packed = opening + actualSum;
+    if (!packed && !shippedBags && !recs.length) continue;
+    // สัดส่วนสาย
+    let share = actualSum ? Object.fromEntries(Object.entries(actualByLine).map(([k, v]) => [k, v / actualSum])) : null;
+    if (!share) {
+      const pl = {};
+      for (const r of recs) if ((r.plannedBags || 0) > 0 && L[r.lineCode]) pl[r.lineCode] = (pl[r.lineCode] ?? 0) + r.plannedBags;
+      const t = Object.values(pl).reduce((a, b) => a + b, 0);
+      share = t ? Object.fromEntries(Object.entries(pl).map(([k, v]) => [k, v / t])) : (() => { const l = lineOfShipment(s); return l && L[l.code] ? { [l.code]: 1 } : {}; })();
+    }
+    const allShipped = s.conts > 0 && loadedUnits.length >= s.conts;
+    const closed = s.status === 'closed' || allShipped; // โหลดออกครบทุกตู้แล้ว = ปิดงานของสาย
+    const shippedRange = from && to ? Math.round(loadedUnits.filter((u) => u.planDate && u.planDate >= from && u.planDate <= to).reduce((a, u) => a + (u.assumed ? bagsPerCont(s) : f(u)), 0)) : 0;
+    for (const [code, k] of Object.entries(share)) {
+      const x = L[code];
+      if (!x) continue;
+      x.shippedRangeMt += shippedRange * k * w;
+      if (closed) { x.closedShipments += k > 0 ? 1 : 0; continue; }
+      x.openShipments += 1;
+      x.packedOpenMt += packed * k * w;
+      x.shippedOpenMt += Math.min(shippedBags, packed) * k * w;
+      x.stockMt += Math.max(0, packed - shippedBags) * k * w;
+      x.needMt += Math.max(0, Number(s.bags) - Math.max(packed, shippedBags)) * k * w;
+    }
+  }
+  return Object.values(L).map((x) => ({ ...x, stockMt: round(x.stockMt, 2), packedOpenMt: round(x.packedOpenMt, 2), shippedOpenMt: round(x.shippedOpenMt, 2), shippedRangeMt: round(x.shippedRangeMt, 2), needMt: round(x.needMt, 2) }));
+}
+
 // ---------------- Excel แผนบรรจุ (มี Loading date + ตัน + คาดการณ์) ----------------
 const XLSX_HEADER = ['วันที่บรรจุ (Pack date)', 'หน้างาน (Site)', 'สายบรรจุ (Line)', 'Shipment', 'สินค้า (Product)',
   'วันโหลดตู้ (Loading date)', 'ตัน/ถุง (MT/bag)', 'ถุงตามแผน (Plan bags)', 'ตันตามแผน (Plan MT)',
@@ -6721,7 +6774,7 @@ const {
 } = __require("backend/services/kk/core.js");
 const { validateShipment, validateSiteDay } = __require("backend/services/kk/rules.js");
 const { dayBoard } = __require("backend/services/kk/loading.js");
-const { capOn, mtPerBag, readiness, validatePackingShipment, linesOf, lineUsage, needsPacking, packDayTotals, packForecast } = __require("backend/services/kk/packing.js");
+const { capOn, lineLedger, mtPerBag, readiness, validatePackingShipment, linesOf, lineUsage, needsPacking, packDayTotals, packForecast } = __require("backend/services/kk/packing.js");
 
 const weekday = (iso) => new Date(`${iso}T00:00:00Z`).getUTCDay();
 
@@ -7047,7 +7100,15 @@ function dashboard({ siteCode = 'KK', from, to, days } = {}) {
     })),
     products: ds.products.map((p) => p.product),
     shipments: ships,
-    lines: fc.lines,
+    // กำลังบรรจุ & งานค้างต่อสาย — กระทบยอดสิ่งที่บรรจุครบ/โหลดออกไปแล้ว
+    lines: (() => {
+      const led = new Map(lineLedger(site.code, { from: start, to: end > today ? addDays(today, -1) : end, today }).map((x) => [x.code, x]));
+      return fc.lines.map((l) => {
+        const x = led.get(l.code) ?? { stockMt: 0, shippedRangeMt: 0, shippedOpenMt: 0, packedOpenMt: 0, openShipments: 0, closedShipments: 0 };
+        const openMt = round(x.stockMt + (l.backlogMt || 0), 2);
+        return { ...l, ...x, openMt, donePct: openMt > 0 ? Math.min(100, Math.round((x.stockMt / openMt) * 100)) : null };
+      });
+    })(),
   };
 }
 
@@ -9405,25 +9466,35 @@ function upcoming(g, site, rerender) {
 
 function linesCard(g) {
   if (!g.lines.length) return h('div');
+  const t2 = (v) => fmt.num(v || 0, 2);
   const bar = (l) => {
-    if (l.donePct == null) return h('span.sub', 'ยังไม่มีงานในสาย');
+    if (l.donePct == null) return h('span', { style: { color: 'var(--green)' } }, l.closedShipments ? '✓ ไม่มีงานค้าง (ส่งออกครบ)' : 'ยังไม่มีงานในสาย');
     const color = l.donePct >= 100 ? 'var(--green)' : 'var(--primary)';
     return h('div', h('div.mini-bar', h('i', { style: { width: `${l.donePct}%`, background: color } }), h('span', `${l.donePct}%`)),
-      h('div.sub', l.donePct >= 100 ? `บรรจุครบแล้ว ${fmt.num(l.doneMt, 2)} ตัน` : `บรรจุแล้ว ${fmt.num(l.doneMt, 2)} / ${fmt.num(l.doneMt + l.backlogMt, 2)} ตัน`));
+      h('div.sub', l.donePct >= 100 ? `บรรจุครบแล้ว รอโหลด ${t2(l.stockMt)} ตัน` : `บรรจุแล้ว ${t2(l.stockMt)} / ${t2(l.openMt)} ตัน`));
   };
-  const loadTxt = (l) => (l.load == null || !l.workDays ? '' : ` · ใช้กำลังสาย ${l.load}% ถึงวันโหลด`);
+  const loadTxt = (l) => (l.load == null || !l.workDays ? '' : `ใช้กำลังสาย ${l.load}% ถึงวันโหลด`);
   const body = g.lines.map((l) => h('tr',
-    h('td.ro', h('b', l.code), h('div.sub', l.name || '')),
-    h('td.ro', `${fmt.num(l.rate)} ถุง/วัน`, h('div.sub', l.source === 'actual' ? 'เฉลี่ยยอดจริง 7 วัน (ยังไม่ได้ตั้งกำลังสาย)' : `กำลังสายที่ตั้งไว้${l.avgActual != null ? ` · เฉลี่ยจริง 7 วัน ${fmt.num(l.avgActual)} ถุง` : ''}`)),
-    h('td.ro.num', h('b', `${fmt.num(l.backlogBags)} ถุง`), h('div.sub', `${fmt.num(l.backlogMt, 1)} ตัน`)),
-    h('td.ro.num', l.workDays ? `${l.workDays} วันทำงาน` : '–', h('div.sub', loadTxt(l).replace(/^ · /, ''))),
+    h('td.ro', h('b', l.code), h('div.sub', l.name || ''), h('div.sub', `${fmt.num(l.openShipments || 0)} Shipment เปิดอยู่${l.closedShipments ? ` · ส่งออกครบ ${fmt.num(l.closedShipments)}` : ''}`)),
+    h('td.ro', `${fmt.num(l.rate)} ถุง/วัน`, h('div.sub', l.source === 'actual' ? 'เฉลี่ยยอดจริง 7 วัน (ยังไม่ได้ตั้งกำลังสาย)' : `กำลังสายที่ตั้งไว้${l.avgActual != null ? ` · เฉลี่ยจริง ${fmt.num(l.avgActual)} ถุง` : ''}`)),
+    h('td.ro.num', h('b', t2(l.openMt)), h('div.sub', 'ตัน (ยังไม่โหลดออก)')),
+    h('td.ro.num', t2(l.stockMt), h('div.sub', 'ตัน')),
+    h('td.ro.num', h('b', `${t2(l.backlogMt)}`), h('div.sub', `ตัน · ${fmt.num(l.backlogBags)} ถุง`)),
+    h('td.ro.num', l.workDays ? `${l.workDays} วันทำงาน` : '–', h('div.sub', loadTxt(l))),
     h('td.ro', l.lastFinish ? dshort(l.lastFinish) : '–'),
-    h('td.ro', { style: { minWidth: '180px' } }, bar(l))));
+    h('td.ro.num', l.shippedRangeMt ? h('b', t2(l.shippedRangeMt)) : '–', h('div.sub', 'ตัน')),
+    h('td.ro', { style: { minWidth: '190px' } }, bar(l))));
+  const sum = (k) => g.lines.reduce((a, l) => a + (l[k] || 0), 0);
   return h('div.card',
-    h('div.card-head', h('h2', 'กำลังบรรจุ & งานค้างต่อสาย'), h('span.hint', 'งานค้าง = ถุงที่ต้องบรรจุให้ทันทุกวันโหลด คิดตามสายที่ลงแผนบรรจุไว้ · % = บรรจุจริงแล้วเทียบกับงานทั้งหมดของสาย')),
+    h('div.card-head', h('h2', 'กำลังบรรจุ & งานค้างต่อสาย'),
+      h('span.hint', 'กระทบยอดแล้ว: Shipment ที่บรรจุครบและโหลดออกครบ ไม่นับเป็นงานของสาย · ตู้ที่โหลดออกแล้ว (Loading date ผ่านมาแล้ว) หักออกจากยอดบรรจุ · งานที่เปิดอยู่ = รอโหลด + ต้องบรรจุอีก')),
     h('div.grid-wrap', h('table.grid',
-      h('thead', h('tr', ['สาย', 'อัตราที่ใช้คาดการณ์', 'งานค้าง', 'ใช้เวลา', 'เสร็จทั้งหมด', 'ความคืบหน้าบรรจุ'].map((t) => h('th', t)))),
-      h('tbody', body))));
+      h('thead', h('tr', ['สาย', 'อัตราที่ใช้คาดการณ์', 'งานที่เปิดอยู่', 'บรรจุแล้ว รอโหลด', 'ต้องบรรจุอีก (งานค้าง)', 'ใช้เวลา', 'เสร็จทั้งหมด', 'โหลดออกแล้ว (ในช่วงวันที่)', 'ความคืบหน้าบรรจุ'].map((t) => h('th', t)))),
+      h('tbody', body),
+      h('tfoot', h('tr',
+        h('td.ro', h('b', 'รวม')), h('td.ro', ''),
+        h('td.ro.num', h('b', t2(sum('openMt')))), h('td.ro.num', t2(sum('stockMt'))), h('td.ro.num', h('b', t2(sum('backlogMt')))),
+        h('td.ro', ''), h('td.ro', ''), h('td.ro.num', h('b', t2(sum('shippedRangeMt')))), h('td.ro', ''))))));
 }
 
 
