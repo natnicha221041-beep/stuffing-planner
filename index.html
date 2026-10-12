@@ -3186,7 +3186,7 @@ const { parseExportPlan, applyImport } = __require("backend/services/kk/importer
 const { planGrid, planCsv, unitsCsv, shipmentDetail, dailySummary, dashboard } = __require("backend/services/kk/views.js");
 const { XLSX_MIME } = __require("backend/lib/xlsxWrite.js");
 const {
-  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, reconcilePlan, reconcileSite, forwardPackPlan, resetPlanTarget, transfersOf, packDailyRange, carryIn, carryOut,
+  packGrid, packDaily, setPackingRecord, autoPackPlan, rolloverPacking, parsePackingFile, applyPackingImport, packingCsv, linesOf, packForecast, packingWorkbook, packingReport, rebalanceCarry, reconcilePlan, reconcileSite, forwardPackPlan, autoPlanCandidates, resetPlanTarget, transfersOf, packDailyRange, carryIn, carryOut,
 } = __require("backend/services/kk/packing.js");
 
 const kkRouter = Router();
@@ -3489,6 +3489,7 @@ const lineSchema = {
   name: { type: 'string', max: 120, default: '' },
   siteCode: { type: 'string', required: true, max: 30 },
   maxBagsPerDay: { type: 'int', min: 0, max: 100000, default: 0 },
+  reduceOthersBags: { type: 'int', min: 0, max: 100000 },
   active: { type: 'bool', default: true },
 };
 const parseProducts = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[,\s]+/)).map((x) => String(x).trim().toUpperCase()).filter(Boolean);
@@ -3505,7 +3506,7 @@ kkRouter.post('/packing-lines', (req, res) => {
 kkRouter.patch('/packing-lines/:id', (req, res) => {
   const l = store.get('packingLines', req.params.id);
   if (!l) throw notFound('สายบรรจุ');
-  const d = parseBody({ name: lineSchema.name, maxBagsPerDay: lineSchema.maxBagsPerDay, active: lineSchema.active }, req.body, { partial: true });
+  const d = parseBody({ name: lineSchema.name, maxBagsPerDay: lineSchema.maxBagsPerDay, reduceOthersBags: lineSchema.reduceOthersBags, active: lineSchema.active }, req.body, { partial: true });
   if (req.body.products !== undefined) d.products = parseProducts(req.body.products);
   // เปลี่ยนรหัสสาย (เช่น KK-L1 → ไลน์ A) — ย้ายรายการบรรจุและ Shipment ที่ใช้รหัสเดิมตามไปด้วย
   let newCode = req.body.code !== undefined ? String(req.body.code).trim() : null;
@@ -3554,8 +3555,9 @@ kkRouter.post('/packing/reconcile', (req, res) => res.json({ carry: reconcileSit
 kkRouter.put('/packing/records', (req, res) => {
   res.json(setPackingRecord(req.body, { force: isForce(req) }));
 });
+kkRouter.get('/packing/autoplan/candidates', (req, res) => res.json(autoPlanCandidates(req.query.site || 'KK')));
 kkRouter.post('/packing/autoplan', (req, res) => {
-  if (req.body.mode === 'forward') return res.json(forwardPackPlan({ siteCode: req.body.siteCode || 'KK', startDate: req.body.startDate, endDate: req.body.endDate, dryRun: !!req.body.dryRun }));
+  if (req.body.mode === 'forward') return res.json(forwardPackPlan({ siteCode: req.body.siteCode || 'KK', startDate: req.body.startDate, endDate: req.body.endDate, shipmentIds: Array.isArray(req.body.shipmentIds) ? req.body.shipmentIds : null, dryRun: !!req.body.dryRun }));
   res.json(autoPackPlan({ siteCode: req.body.siteCode || 'KK', startDate: req.body.startDate, dryRun: !!req.body.dryRun }));
 });
 kkRouter.post('/packing/rollover', (req, res) => {
@@ -4360,6 +4362,9 @@ Object.defineProperty(__exports, "resetPlanTarget", { enumerable: true, get: () 
 Object.defineProperty(__exports, "transfersOf", { enumerable: true, get: () => transfersOf });
 Object.defineProperty(__exports, "lineUsageMt", { enumerable: true, get: () => lineUsageMt });
 Object.defineProperty(__exports, "lineUsage", { enumerable: true, get: () => lineUsage });
+Object.defineProperty(__exports, "reduceOthersOf", { enumerable: true, get: () => reduceOthersOf });
+Object.defineProperty(__exports, "capCuts", { enumerable: true, get: () => capCuts });
+Object.defineProperty(__exports, "capOn", { enumerable: true, get: () => capOn });
 Object.defineProperty(__exports, "lineLevel", { enumerable: true, get: () => lineLevel });
 Object.defineProperty(__exports, "unitBagsFn", { enumerable: true, get: () => unitBagsFn });
 Object.defineProperty(__exports, "loadBagsOn", { enumerable: true, get: () => loadBagsOn });
@@ -4371,6 +4376,7 @@ Object.defineProperty(__exports, "packGrid", { enumerable: true, get: () => pack
 Object.defineProperty(__exports, "packDaily", { enumerable: true, get: () => packDaily });
 Object.defineProperty(__exports, "autoPackPlan", { enumerable: true, get: () => autoPackPlan });
 Object.defineProperty(__exports, "forwardPackPlan", { enumerable: true, get: () => forwardPackPlan });
+Object.defineProperty(__exports, "autoPlanCandidates", { enumerable: true, get: () => autoPlanCandidates });
 Object.defineProperty(__exports, "rolloverPacking", { enumerable: true, get: () => rolloverPacking });
 Object.defineProperty(__exports, "CSV_HEADER", { enumerable: true, get: () => CSV_HEADER });
 Object.defineProperty(__exports, "parsePackingFile", { enumerable: true, get: () => parsePackingFile });
@@ -4544,6 +4550,16 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
     .filter((q) => q.w > 0 && q.start)
     .sort((a, b) => a.start.localeCompare(b.start) || firstLoad(a.s).localeCompare(firstLoad(b.s)) || a.s.code.localeCompare(b.s.code));
   if (!queue.length) return [];
+  // แผนพอดีอยู่แล้ว (แผนข้างหน้าของทุก Shipment = ถุงที่ยังต้องบรรจุ และไม่มีวันไหนเกินกำลังสาย) → ไม่ต้องจัดใหม่
+  // (คงแผนที่ผู้ใช้หรือ "จัดแผนอัตโนมัติ" วางไว้ เช่น Shipment ที่ไม่ได้เลือกให้จัดใหม่)
+  {
+    const planned = (id) => open.filter((r) => r.shipmentId === id).reduce((a, r) => a + r.plannedBags, 0);
+    const lastAct = recs.filter((r) => r.actualBags != null).map((r) => r.date).sort().at(-1);
+    const fits = queue.every((q) => planned(q.s.id) === q.need)
+      && !open.some((r) => lastAct && r.date <= lastAct)
+      && !open.some((r) => { const L = store.findOne('packingLines', (l) => l.code === r.lineCode && l.siteCode === s0.siteCode); return L?.maxBagsPerDay && lineUsage(L.code, r.date) > capOn(L, r.date); });
+    if (fits) return [];
+  }
 
   // สายที่ใช้ = สายของแผนข้างหน้า (ไม่มีก็สายล่าสุดที่บรรจุ / สายของ Shipment)
   const lineCodes = [...new Set(open.map((r) => r.lineCode))];
@@ -4553,7 +4569,7 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
     if (l) lineCodes.push(l);
   }
   const lines = lineCodes.map((c) => store.findOne('packingLines', (l) => l.code === c && l.siteCode === s0.siteCode)).filter(Boolean)
-    .sort((a, b) => a.code.localeCompare(b.code));
+    .sort(borrowersFirst);
   // วันเริ่ม = วันแรกของแผนข้างหน้า (ไม่ก่อนวันนี้)
   let d = open.map((r) => r.date).sort()[0] ?? today;
   if (d < today) d = today;
@@ -4572,7 +4588,8 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
     for (const line of lines) {
       if (!(line.maxBagsPerDay > 0)) continue;
       // ห้องว่างของสายวันนั้น (คิดเป็นตันตามน้ำหนักถุงของสินค้านี้)
-      let roomBags = line.maxBagsPerDay - otherUsed(line.code, d);
+      const simUse = (code, dd) => otherUsed(code, dd) + [...alloc.entries()].filter(([k]) => k.endsWith(`|${dd}|${code}`)).reduce((a, [, v]) => a + v, 0);
+      let roomBags = capOn(line, d, simUse) - otherUsed(line.code, d);
       while (qi < queue.length && roomBags > 0) {
         const q = queue[qi];
         if (q.need <= 0) { qi++; continue; }
@@ -4644,6 +4661,26 @@ function lineUsageMt(lineCode, date) {
 function lineUsage(lineCode, date) {
   return store.find('packingRecords', (r) => r.lineCode === lineCode && r.date === date).reduce((a, r) => a + effBags(r), 0);
 }
+
+/**
+ * สายที่ "ยืมคน" จากสายอื่น เช่น KK-MANUAL PACK: วันไหนมีงานบนสายนี้ สายอื่นทุกสายลดกำลังลงวันละ X ถุง
+ * ตั้งค่าได้ที่สาย (reduceOthersBags) · ไม่ตั้ง = สายที่ชื่อมีคำว่า MANUAL ใช้ 25 ถุง อื่น ๆ 0
+ */
+const reduceOthersOf = (l) => (!l ? 0 : l.reduceOthersBags != null && l.reduceOthersBags !== '' ? Number(l.reduceOthersBags) || 0 : /MANUAL/i.test(l.code || '') ? 25 : 0);
+/** สายที่ทำให้สาย line วันนั้นลดกำลัง (usageOf = ใช้งานของสายในวันนั้น) */
+function capCuts(line, date, usageOf = lineUsage) {
+  if (!line) return [];
+  return linesOf(line.siteCode).filter((o) => o.code !== line.code && reduceOthersOf(o) > 0 && usageOf(o.code, date) > 0)
+    .map((o) => ({ line: o.code, bags: reduceOthersOf(o) }));
+}
+/** กำลังบรรจุจริงของสายในวันนั้น = กำลังสาย − ส่วนที่ลดเพราะมีงานบนสายแพคมือ */
+function capOn(line, date, usageOf = lineUsage) {
+  const cap = Number(line?.maxBagsPerDay || 0);
+  if (!cap) return 0;
+  return Math.max(0, cap - capCuts(line, date, usageOf).reduce((a, c) => a + c.bags, 0));
+}
+/** เรียงสายให้สายที่ลดกำลังสายอื่น (แพคมือ) ถูกจัดก่อน */
+const borrowersFirst = (a, b) => (reduceOthersOf(b) > 0 ? 1 : 0) - (reduceOthersOf(a) > 0 ? 1 : 0) || a.code.localeCompare(b.code);
 
 function lineLevel(used, cap) {
   if (!cap) return 'green';
@@ -4746,10 +4783,11 @@ function validateLineDay(lineCode, date) {
   const line = store.findOne('packingLines', (l) => l.code === lineCode);
   if (!line?.maxBagsPerDay) return [];
   const used = lineUsage(lineCode, date);
-  if (used <= line.maxBagsPerDay) return [];
+  const cap = capOn(line, date);
+  if (used <= cap) return [];
   return [{
     key: `LINE_OVER:${lineCode}:${date}`, code: 'LINE_OVER', severity: 'error', forceable: true, metric: used,
-    message: `เกินกำลังบรรจุของสาย ${lineCode} วันที่ ${date}: ${used}/${line.maxBagsPerDay} ถุง เกิน ${used - line.maxBagsPerDay} ถุง`,
+    message: `เกินกำลังบรรจุของสาย ${lineCode} วันที่ ${date}: ${used}/${cap} ถุง เกิน ${used - cap} ถุง${cap < line.maxBagsPerDay ? ` (ลดจาก ${line.maxBagsPerDay} เพราะใช้สาย ${capCuts(line, date).map((c) => c.line).join(', ')})` : ''}`,
     ref: { lineCode, date, siteCode: line.siteCode },
   }];
 }
@@ -4860,7 +4898,8 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
     ...l,
     days: dates.map((d) => {
       const used = lineUsage(l.code, d);
-      return { date: d, used, usedMt: lineUsageMt(l.code, d), cap: l.maxBagsPerDay, level: lineLevel(used, l.maxBagsPerDay), over: l.maxBagsPerDay ? Math.max(0, used - l.maxBagsPerDay) : 0 };
+      const cap = capOn(l, d);
+      return { date: d, used, usedMt: lineUsageMt(l.code, d), cap, baseCap: l.maxBagsPerDay, cuts: capCuts(l, d), level: lineLevel(used, cap), over: l.maxBagsPerDay ? Math.max(0, used - cap) : 0 };
     }),
   }));
   const needle = q.trim().toLowerCase();
@@ -4914,7 +4953,7 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
       remainingToPlanMt: round(rows.reduce((a, r) => a + r.readiness.remainingToPlan * (r.mtPerBag || 0), 0), 2),
       lineOverDays: lines.reduce((a, l) => a + l.days.filter((d) => d.over > 0 && d.date >= today).length, 0),
       todayPlanned: lines.reduce((a, l) => a + (l.days.find((d) => d.date === today)?.used ?? 0), 0),
-      todayCap: lines.reduce((a, l) => a + (l.maxBagsPerDay || 0), 0),
+      todayCap: lines.reduce((a, l) => a + capOn(l, today), 0),
       today: packDayTotals(site.code, today),
       range: dates.reduce((a, d) => { const t = packDayTotals(site.code, d); a.plannedMt = round(a.plannedMt + t.plannedMt, 2); a.actualMt = round(a.actualMt + (t.actualMt ?? 0), 2); a.plannedBags += t.plannedBags; a.actualBags += t.actualBags ?? 0; return a; }, { plannedMt: 0, actualMt: 0, plannedBags: 0, actualBags: 0 }),
       leadDays: Number(site.packLeadDays ?? 0),
@@ -4957,7 +4996,8 @@ function packDaily(siteCode, date) {
   rows.sort((a, b) => (a.lineCode || '').localeCompare(b.lineCode || '') || a.code.localeCompare(b.code));
   const lines = linesOf(site.code).map((l) => {
     const used = lineUsage(l.code, date);
-    return { code: l.code, name: l.name, cap: l.maxBagsPerDay, used, usedMt: lineUsageMt(l.code, date), level: lineLevel(used, l.maxBagsPerDay) };
+    const cap = capOn(l, date);
+    return { code: l.code, name: l.name, cap, baseCap: l.maxBagsPerDay, cuts: capCuts(l, date), used, usedMt: lineUsageMt(l.code, date), level: lineLevel(used, cap) };
   });
   const sum = (k) => rows.reduce((a, r) => a + (r[k] ?? 0), 0);
   return {
@@ -5006,7 +5046,7 @@ function autoPackPlan({ siteCode = 'KK', startDate, dryRun = false } = {}) {
         if (deficit <= 0) continue;
         for (let d = c.readyBy; d >= start && deficit > 0; d = addDays(d, -1)) {
           if (closed.has(weekday(d))) continue;
-          const room = cap - usedOf(line.code, d);
+          const room = (line.maxBagsPerDay ? capOn(line, d) : cap) - usedOf(line.code, d);
           if (room <= 0) continue;
           const take = Math.min(room, deficit);
           const rec = findRecord(s.id, d, line.code);
@@ -5050,7 +5090,7 @@ function autoPackPlan({ siteCode = 'KK', startDate, dryRun = false } = {}) {
  *   • ลำดับในสาย = ตัวที่เริ่มบรรจุแล้วก่อน แล้วตามวันโหลด (โหลดก่อนบรรจุก่อน)
  *   • แผนเดิมตั้งแต่ startDate ที่ยังไม่มียอดจริงจะถูกแทนที่ · ยอดจริงที่บันทึกแล้วไม่ถูกแตะ
  */
-function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false } = {}) {
+function forwardPackPlan({ siteCode = 'KK', startDate, endDate, shipmentIds = null, dryRun = false } = {}) {
   const site = siteOf(siteCode);
   if (!site) throw notFound(`หน้างาน ${siteCode}`);
   const today = todayISO();
@@ -5065,13 +5105,16 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false }
   const workdays = (a, b) => { let n = 0; for (let d = a; d <= b; d = addDays(d, 1)) if (isWork(d)) n++; return n; };
 
   const run = () => {
-    const lines = linesOf(site.code).filter((l) => l.maxBagsPerDay > 0);
+    const lines = linesOf(site.code).filter((l) => l.maxBagsPerDay > 0).sort(borrowersFirst);
     if (!lines.length) throw badRequest('ยังไม่ได้ตั้งกำลังบรรจุ (ถุง/วัน) ของสายบรรจุ — ตั้งที่ตารางสายบรรจุก่อน');
     const lineSet = new Set(lines.map((l) => l.code));
-    const replace = (r) => r.actualBags == null && r.date >= start && !r.rolledOver;
-    const ships = store.find('shipments', (x) => x.siteCode === site.code && needsPacking(x));
+    // เลือกเฉพาะบาง Shipment ได้ — ตัวที่ไม่เลือก แผนเดิมคงไว้ (นับเป็นงานที่ใช้กำลังสายอยู่แล้ว)
+    const pick = Array.isArray(shipmentIds) ? new Set(shipmentIds) : null;
+    const ships = store.find('shipments', (x) => x.siteCode === site.code && needsPacking(x) && (!pick || pick.has(x.id)));
     const idsAll = new Set(ships.map((x) => x.id));
+    const replace = (r) => idsAll.has(r.shipmentId) && r.actualBags == null && r.date >= start && !r.rolledOver;
     const allRecs = store.find('packingRecords', (r) => idsAll.has(r.shipmentId));
+    const siteRecs = store.find('packingRecords', (r) => store.get('shipments', r.shipmentId)?.siteCode === site.code);
     const recsOf = (id) => allRecs.filter((r) => r.shipmentId === id);
     const remainingOf = (s) => {
       const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * bagsPerCont(s));
@@ -5090,7 +5133,7 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false }
     const prodLine = (it) => {
       const key = prodKey(it.s);
       if (!key) return null;
-      return allRecs.filter((r) => lineSet.has(r.lineCode) && prodKey(store.get('shipments', r.shipmentId)) === key).sort((a, b) => b.date.localeCompare(a.date))[0]?.lineCode ?? null;
+      return siteRecs.filter((r) => lineSet.has(r.lineCode) && prodKey(store.get('shipments', r.shipmentId)) === key).sort((a, b) => b.date.localeCompare(a.date))[0]?.lineCode ?? null;
     };
     const order = (a, b) => (a.started ? 0 : 1) - (b.started ? 0 : 1) || (a.started ?? '').localeCompare(b.started ?? '')
       || (a.loads[0] ?? '9999').localeCompare(b.loads[0] ?? '9999') || a.s.code.localeCompare(b.s.code);
@@ -5107,6 +5150,8 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false }
     const otherUsed = (lineCode, d) => store.find('packingRecords', (r) => r.lineCode === lineCode && r.date === d && !(idsAll.has(r.shipmentId) && replace(r)))
       .reduce((a, r) => a + effBags(r), 0);
     const alloc = new Map();
+    const simDay = new Map(); // line|date → ถุงที่จัดในรอบนี้
+    const simUse = (code, dd) => otherUsed(code, dd) + (simDay.get(`${code}|${dd}`) ?? 0);
     const lineStat = {};
     for (const L of lines) {
       const q = items.filter((it) => it.line === L.code);
@@ -5114,7 +5159,7 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false }
       let qi = 0;
       for (let d = start, i = 0; qi < q.length && i < 730; d = addDays(d, 1), i++) {
         if (!isWork(d)) continue;
-        let room = L.maxBagsPerDay - otherUsed(L.code, d);
+        let room = capOn(L, d, simUse) - otherUsed(L.code, d);
         let used = false;
         while (qi < q.length && room > 0) {
           const it = q[qi];
@@ -5124,6 +5169,7 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false }
           const n = Math.min(it.need, room);
           const k = `${it.s.id}|${d}|${L.code}`;
           alloc.set(k, (alloc.get(k) ?? 0) + n);
+          simDay.set(`${L.code}|${d}`, (simDay.get(`${L.code}|${d}`) ?? 0) + n);
           it.need -= n; room -= n; used = true;
           it.first ??= d; it.finish = d;
           it.mtInRange = (it.mtInRange ?? 0) + (!end || d <= end ? n * it.w : 0);
@@ -5176,6 +5222,27 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, dryRun = false }
     };
   };
   return dryRun ? store.simulate(run) : store.transaction(run);
+}
+
+/** รายการ Shipment ให้เลือกจัดแผนอัตโนมัติ: ยังไม่ลงแผน / ลงแผนบางส่วน / ลงแผนครบแล้ว */
+function autoPlanCandidates(siteCode = 'KK') {
+  const today = todayISO();
+  return store.find('shipments', (x) => x.siteCode === siteCode && needsPacking(x)).map((s) => {
+    const r = readiness(s, today);
+    const w = mtPerBag(s);
+    const recs = recordsOf(s.id);
+    const future = recs.filter((x) => x.actualBags == null && x.date >= today).reduce((a, x) => a + (x.plannedBags || 0), 0);
+    const remaining = Math.max(0, Number(s.bags) - r.packedDone);
+    const status = remaining <= 0 ? 'done' : future <= 0 ? 'none' : future + 0 < remaining ? 'partial' : 'full';
+    const loads = store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort();
+    const dates = recs.filter((x) => x.actualBags == null && x.date >= today && x.plannedBags > 0).map((x) => x.date).sort();
+    return {
+      id: s.id, code: s.code, customerName: s.customerName, product: s.product, line: lineOfShipment(s)?.code ?? null,
+      mt: round(s.mt || 0, 2), remainingMt: round(remaining * w, 2), plannedMt: round(future * w, 2),
+      planFrom: dates[0] ?? null, planTo: dates.at(-1) ?? null, nextLoad: loads[0] ?? null, lastLoad: loads.at(-1) ?? null, status,
+    };
+  }).filter((x) => x.status !== 'done')
+    .sort((a, b) => (a.nextLoad ?? '9999').localeCompare(b.nextLoad ?? '9999') || a.code.localeCompare(b.code));
 }
 
 /** ปัดยอดที่บรรจุไม่ครบแผน ไปวันทำงานถัดไป (สายเดิม) */
@@ -5411,7 +5478,7 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
   const isWork = (d) => !closed.has(weekday(d));
   const prevWork = (d) => { let x = d; for (let i = 0; i < 7 && !isWork(x); i++) x = addDays(x, -1); return x; };
 
-  const lines = linesOf(site.code).map((l) => ({ ...l, ...lineRate(l, today) }));
+  const lines = linesOf(site.code).map((l) => ({ ...l, ...lineRate(l, today) })).sort(borrowersFirst);
   const lineMap = new Map(lines.map((l) => [l.code, l]));
   const ships = [];
   const allT = [];
@@ -5459,11 +5526,16 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
     L.workDays = 0; L.backlog = 0; L.backlogMt = 0; L.lastFinish = '';
     L.capLeft = Math.max(0, L.rate - store.find('packingRecords', (r) => r.lineCode === L.code && r.date === today && r.actualBags != null).reduce((a, r) => a + r.actualBags, 0));
   }
+  const simUsed = new Map();
   let d = today;
   for (let i = 0; i < horizon && allT.some((t) => t.left > 0); i++, d = addDays(d, 1)) {
     if (!isWork(d)) continue;
+    const fcUse = (code, dd) => (simUsed.get(`${code}|${dd}`) ?? 0) + lineUsage(code, dd);
     for (const L of lines) {
       let cap = d === today ? L.capLeft : L.rate;
+      // มีงานบนสายแพคมือวันนั้น → สายนี้ลดกำลัง
+      const cut = capCuts(L, d, fcUse).reduce((a, c) => a + c.bags, 0);
+      if (cut) cap = Math.max(0, cap - cut);
       let used = 0;
       for (const t of allT) {
         if (cap <= 0) break;
@@ -5473,7 +5545,7 @@ function packForecast(siteCode, { today = todayISO(), horizon = 120 } = {}) {
         t.lines.add(L.code);
         if (t.left === 0) t.finish = d;
       }
-      if (used > 0) { L.workDays += 1; L.backlog += used; L.lastFinish = d; }
+      if (used > 0) { L.workDays += 1; L.backlog += used; L.lastFinish = d; simUsed.set(`${L.code}|${d}`, used); }
     }
   }
   for (const L of lines) L.unfinished = allT.filter((t) => t.left > 0 && (!t.fixed || t.fixed.has(L.code))).length;
@@ -6649,7 +6721,7 @@ const {
 } = __require("backend/services/kk/core.js");
 const { validateShipment, validateSiteDay } = __require("backend/services/kk/rules.js");
 const { dayBoard } = __require("backend/services/kk/loading.js");
-const { mtPerBag, readiness, validatePackingShipment, linesOf, lineUsage, needsPacking, packDayTotals, packForecast } = __require("backend/services/kk/packing.js");
+const { capOn, mtPerBag, readiness, validatePackingShipment, linesOf, lineUsage, needsPacking, packDayTotals, packForecast } = __require("backend/services/kk/packing.js");
 
 const weekday = (iso) => new Date(`${iso}T00:00:00Z`).getUTCDay();
 
@@ -6879,7 +6951,7 @@ function dailySummary({ siteCode = 'KK', from, days = 14 } = {}) {
   const dayInfo = dates.map((d) => {
     const count = siteDayCount(site.code, d);
     const packUsed = lines.reduce((a, l) => a + lineUsage(l.code, d), 0);
-    const packCap = lines.reduce((a, l) => a + (l.maxBagsPerDay || 0), 0);
+    const packCap = lines.reduce((a, l) => a + capOn(l, d), 0);
     const items = detail[d].sort((a, b) => a.product.localeCompare(b.product) || a.code.localeCompare(b.code));
     return {
       date: d, past: d < today, count, max: site.maxContainersPerDay, level: levelOfCount(count, site.maxContainersPerDay),
@@ -9595,7 +9667,7 @@ function lineTable(g, site, rerender) {
   const addBtn = h('button.btn.small', { type: 'button', onclick: () => openLineEdit(null, site, rerender) }, '+ เพิ่มสายบรรจุ');
   if (!g.lines.length) return h('div.card', h('div.card-head', h('h2', 'สายบรรจุ'), addBtn), h('div.empty', 'หน้างานนี้ยังไม่มีสายบรรจุ'));
   return h('div.card',
-    h('div.card-head', h('h2', 'กำลังบรรจุของสาย (ตัน/วัน · กำลังเป็นถุง/วัน)'), h('span.hint', 'กด ✎ เพื่อเปลี่ยนชื่อ/กำลังบรรจุ · คลิกช่องวันที่เพื่อย้ายงานไปสายอื่น · เขียว = ปกติ · เหลือง ≥85% · แดง = เกินกำลัง'), h('div.spacer'), addBtn),
+    h('div.card-head', h('h2', 'กำลังบรรจุของสาย (ตัน/วัน · กำลังเป็นถุง/วัน)'), h('span.hint', 'กด ✎ เพื่อเปลี่ยนชื่อ/กำลังบรรจุ · คลิกช่องวันที่เพื่อย้ายงานไปสายอื่น · เขียว = ปกติ · เหลือง ≥85% · แดง = เกินกำลัง · วันที่มีงานบนสายแพคมือ (MANUAL) สายอื่นลดกำลังให้อัตโนมัติ'), h('div.spacer'), addBtn),
     h('div.pgrid-wrap', { style: { maxHeight: 'none' } }, h('table.pgrid',
       h('thead', h('tr', h('th.sticky-col', 'สายบรรจุ'), h('th.num', 'กำลัง/วัน'), g.dates.map((d) => dayHead(d, g.today)))),
       h('tbody', g.lines.map((l) => {
@@ -9607,9 +9679,10 @@ function lineTable(g, site, rerender) {
           h('td.sticky-col', h('div.ship-head', h('b', l.code), h('span.row-acts', h('button.icon-btn', { type: 'button', title: 'แก้ไขสาย (ชื่อ / รหัส / กำลังบรรจุ)', onclick: () => openLineEdit(l, site, rerender) }, '✎'))), h('div.sub', l.name || '')),
           h('td.num', { style: { minWidth: '90px' } }, cap),
           l.days.map((d) => h(`td.cnt-cell.${d.level}${d.date === g.today ? '.today' : ''}`, {
-            title: `${d.used}/${d.cap ?? '-'} ถุง — คลิกเพื่อดู/ย้ายงาน`, style: { cursor: d.used ? 'pointer' : null },
+            title: `${d.used}/${d.cap ?? '-'} ถุง${d.cuts?.length ? ` (กำลังลดจาก ${d.baseCap} เพราะใช้สาย ${d.cuts.map((c) => `${c.line} −${c.bags}`).join(', ')})` : ''} — คลิกเพื่อดู/ย้ายงาน`, style: { cursor: d.used ? 'pointer' : null },
             onclick: () => { if (d.used) openLineDay(l, d.date, g.lines, site, rerender); },
-          }, d.used ? [h('b', fmt.num(d.usedMt, 1)), h('div.sub', `${fmt.num(d.used)} ถุง`)] : '', d.over ? h('div.over', `+${d.over} ถุง`) : '')));
+          }, d.used ? [h('b', fmt.num(d.usedMt, 1)), h('div.sub', `${fmt.num(d.used)} ถุง`)] : '', d.over ? h('div.over', `+${d.over} ถุง`) : '',
+          d.cuts?.length ? h('div.sub', { style: { color: '#92400e', fontSize: '11px' } }, `กำลัง ${fmt.num(d.cap)} (−${d.cuts.reduce((a, c) => a + c.bags, 0)})`) : '')));
       })))));
 }
 
@@ -9620,6 +9693,12 @@ function openLineEdit(l, site, rerender) {
   const name = h('input.inp', { value: l?.name ?? '', placeholder: 'เช่น เครื่องบรรจุ Big bag หน้าโกดัง 1' });
   const cap = h('input.inp', { type: 'number', min: 0, step: 1, value: l?.maxBagsPerDay ?? 300 });
   const active = h('input', { type: 'checkbox', checked: l ? l.active !== false : true });
+  // ลดกำลังสายอื่นเมื่อใช้สายนี้ (เช่น สายแพคมือยืมคนจากสายอื่น) — เว้นว่าง: สายชื่อ MANUAL = 25 ถุง, อื่น ๆ = 0
+  const defCut = (c) => (/MANUAL/i.test(c || '') ? 25 : 0);
+  const cut = h('input.inp', { type: 'number', min: 0, step: 1, value: l?.reduceOthersBags ?? defCut(l?.code ?? ''), placeholder: '0' });
+  let cutTouched = l?.reduceOthersBags != null;
+  cut.addEventListener('input', () => { cutTouched = true; });
+  code.addEventListener('input', () => { if (!cutTouched) cut.value = defCut(code.value); });
   const actions = [{ label: 'ยกเลิก', onClick: (c) => c() }];
   if (!isNew) {
     actions.unshift({
@@ -9634,7 +9713,7 @@ function openLineEdit(l, site, rerender) {
     label: isNew ? 'เพิ่มสาย' : 'บันทึก', cls: 'primary',
     onClick: async (close) => {
       if (!code.value.trim()) return toast('กรอกรหัส/ชื่อย่อของสาย', 'warn');
-      const body = { code: code.value.trim(), name: name.value.trim(), maxBagsPerDay: Number(cap.value || 0), active: active.checked };
+      const body = { code: code.value.trim(), name: name.value.trim(), maxBagsPerDay: Number(cap.value || 0), reduceOthersBags: Number(cut.value || 0), active: active.checked };
       try {
         if (isNew) await api.post('/kk/packing-lines', { ...body, siteCode: site.code });
         else await api.patch(`/kk/packing-lines/${l.id}`, body);
@@ -9651,6 +9730,8 @@ function openLineEdit(l, site, rerender) {
       field('รหัส / ชื่อย่อสาย (แสดงในตาราง)', code),
       field('ชื่อเต็ม / รายละเอียด', name),
       field('กำลังบรรจุ (ถุง/วัน)', cap),
+      field('เมื่อใช้สายนี้ ลดกำลังสายอื่นวันละ (ถุง)', cut),
+      h('div.sub', { style: { marginTop: '-6px' } }, 'วันไหนมีงานบนสายนี้ สายอื่นทุกสายจะลดกำลังลงตามจำนวนนี้อัตโนมัติ (เช่น สายแพคมือยืมคนจากสายอื่น) · 0 = ไม่ลด'),
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, active, 'ใช้งานสายนี้'),
       isNew ? null : h('div.sub', 'เปลี่ยนรหัสแล้ว แผน/ยอดบรรจุเดิมของสายนี้จะย้ายตามไปให้อัตโนมัติ')),
     actions,
@@ -9841,7 +9922,7 @@ function packImportReport(r) {
 }
 
 // ---------- จัดแผนบรรจุอัตโนมัติ (เดินเต็มกำลังสาย ตามช่วงวันที่) ----------
-function openAutoPack(site, kkMeta, rerender) {
+async function openAutoPack(site, kkMeta, rerender) {
   const today = kkMeta.today;
   const monthEnd = (() => { const [y, m] = today.split('-').map(Number); const d = new Date(Date.UTC(y, m, 0)); return d.toISOString().slice(0, 10); })();
   const start = h('input.inp', { type: 'date', value: today, min: today });
@@ -9849,6 +9930,35 @@ function openAutoPack(site, kkMeta, rerender) {
   const d = (iso) => (iso ? fmt.date(iso, { day: 'numeric', month: 'short' }) : '–');
   const dl = (iso) => (iso ? fmt.dateLong(iso) : '–');
   const out = h('div.muted', 'เลือกวันที่เริ่ม และวันที่ต้องการให้บรรจุเสร็จ แล้วกด "คำนวณ" — ระบบเดินเต็มกำลังสายทุกวันทำงาน (ข้ามวันหยุดหน้างาน) จนครบทุก Shipment แล้วบอกว่าจะเสร็จวันไหน');
+  // ---- เลือก Shipment ที่จะจัดแผนใหม่ (ค่าเริ่มต้น: ยังไม่ลงแผน / ลงแผนไม่ครบ) ----
+  let cands = [];
+  try { cands = await api.get(`/kk/packing/autoplan/candidates?site=${encodeURIComponent(site.code)}`); } catch (e) { toast(e.message, 'error'); }
+  const picked = new Set(cands.filter((c) => c.status !== 'full').map((c) => c.id));
+  const ST = { none: ['ยังไม่ลงแผน', 'red'], partial: ['ลงแผนไม่ครบ', 'yellow'], full: ['ลงแผนครบแล้ว', 'green'] };
+  const pickWrap = h('div');
+  let recalcT;
+  const changed = () => { previewed = false; clearTimeout(recalcT); recalcT = setTimeout(() => run(true), 350); drawPick(); };
+  const drawPick = () => {
+    const cnt = h('span.sub', `เลือก ${picked.size} จาก ${cands.length} Shipment`);
+    const setAll = (fn) => { picked.clear(); cands.filter(fn).forEach((c) => picked.add(c.id)); changed(); };
+    pickWrap.replaceChildren(h('div.card',
+      h('div.card-head', h('h2', 'เลือก Shipment ที่จะจัดแผนบรรจุใหม่'), cnt, h('div.spacer'),
+        h('button.btn.small', { type: 'button', onclick: () => setAll((c) => c.status !== 'full') }, 'เฉพาะที่ยังไม่ครบ'),
+        h('button.btn.small', { type: 'button', onclick: () => setAll(() => true) }, 'เลือกทั้งหมด'),
+        h('button.btn.small', { type: 'button', onclick: () => setAll(() => false) }, 'ไม่เลือก')),
+      h('div.sub', { style: { padding: '0 16px 8px' } }, 'ตัวที่ไม่เลือก = แผนเดิมคงไว้ไม่ถูกแก้ ระบบจะจัดตัวที่เลือกลงในกำลังสายที่ยังว่างอยู่'),
+      cands.length ? h('div.grid-wrap', { style: { maxHeight: '230px' } }, h('table.grid',
+        h('thead', h('tr', ['', 'Shipment', 'สินค้า', 'สาย', 'สถานะแผน', 'แผนเดิม (ตัน)', 'ยังต้องบรรจุ (ตัน)', 'Loading'].map((t) => h('th', t)))),
+        h('tbody', cands.map((c) => {
+          const cb = h('input', { type: 'checkbox', checked: picked.has(c.id), onchange: (e) => { if (e.target.checked) picked.add(c.id); else picked.delete(c.id); changed(); } });
+          return h(`tr${picked.has(c.id) ? '' : '.done'}`, { style: { cursor: 'pointer' }, onclick: (e) => { if (e.target !== cb) { cb.checked = !cb.checked; cb.onchange({ target: cb }); } } },
+            h('td', cb), h('td.ro', h('b.mono', c.code), h('div.sub', c.customerName || '')), h('td.ro', c.product || '-'), h('td.ro', c.line || '-'),
+            h('td.ro', badge(ST[c.status][0], ST[c.status][1])),
+            h('td.ro.num', c.plannedMt ? [fmt.num(c.plannedMt, 2), h('div.sub', `${d(c.planFrom)} – ${d(c.planTo)}`)] : '–'),
+            h('td.ro.num', h('b', fmt.num(c.remainingMt, 2))),
+            h('td.ro', c.lastLoad ? d(c.lastLoad) : h('span.sub', '–')));
+        })))) : h('div.empty', 'ไม่มี Shipment ที่ยังต้องบรรจุ')));
+  };
   let previewed = false;
   const yesNo = (v, okTxt = 'ทัน', ngTxt = 'ไม่ทัน') => (v == null ? '–' : badge(v ? `✓ ${okTxt}` : `✗ ${ngTxt}`, v ? 'green' : 'red'));
   const draw = (r) => {
@@ -9888,15 +9998,17 @@ function openAutoPack(site, kkMeta, rerender) {
     if (!start.value) return toast('เลือกวันที่เริ่ม', 'warn');
     if (end.value && end.value < start.value) return toast('วันที่ต้องการให้เสร็จ ต้องไม่ก่อนวันที่เริ่ม', 'warn');
     try {
-      const r = await api.post('/kk/packing/autoplan', { siteCode: site.code, mode: 'forward', startDate: start.value, endDate: end.value || null, dryRun });
+      if (!picked.size) { out.replaceChildren(h('div.issue.info', h('span.ic', 'i'), 'ยังไม่ได้เลือก Shipment — ติ๊กเลือกตัวที่ต้องการให้จัดแผนใหม่ด้านบน')); previewed = false; return; }
+      const r = await api.post('/kk/packing/autoplan', { siteCode: site.code, mode: 'forward', startDate: start.value, endDate: end.value || null, shipmentIds: [...picked], dryRun });
       if (dryRun) { previewed = true; draw(r); return; }
       close();
-      toast(`บันทึกแผนบรรจุ ${fmt.num(r.summary.mt, 2)} ตัน · เสร็จ ${dl(r.summary.finishAll)}`, 'success', 6000);
+      toast(`บันทึกแผนบรรจุ ${r.summary.shipments} Shipment · ${fmt.num(r.summary.mt, 2)} ตัน · เสร็จ ${dl(r.summary.finishAll)}`, 'success', 6000);
       rerender();
     } catch (e) { toast(e.message, 'error', 6000); }
   };
   const quick = (label, days) => h('button.btn.small', { type: 'button', onclick: () => { end.value = addDays(start.value || today, days); run(true); } }, label);
   [start, end].forEach((x) => x.addEventListener('change', () => { previewed = false; }));
+  drawPick();
   modal({
     title: `จัดแผนบรรจุอัตโนมัติ (เดินเต็มกำลังสาย) — ${site.code}`,
     wide: true,
@@ -9905,8 +10017,8 @@ function openAutoPack(site, kkMeta, rerender) {
       h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '6px 0 10px' } }, h('span.sub', 'ช่วงลัด:'),
         quick('7 วัน', 6), quick('14 วัน', 13), quick('30 วัน', 29),
         h('button.btn.small', { type: 'button', onclick: () => { end.value = monthEnd; run(true); } }, 'ถึงสิ้นเดือน')),
-      h('div.sub', { style: { marginBottom: '10px' } }, 'แผนเดิมตั้งแต่วันที่เริ่มที่ยังไม่มียอดจริงจะถูกแทนที่ · ยอดบรรจุจริงที่บันทึกแล้วไม่ถูกแตะ · แต่ละ Shipment บรรจุในสายเดิมที่เคยบรรจุ / สายของสินค้าเดียวกัน'),
-      out],
+      h('div.sub', { style: { marginBottom: '10px' } }, 'เฉพาะ Shipment ที่เลือก: แผนเดิมตั้งแต่วันที่เริ่มที่ยังไม่มียอดจริงจะถูกแทนที่ · ยอดบรรจุจริงที่บันทึกแล้วไม่ถูกแตะ · บรรจุในสายเดิมที่เคยบรรจุ / สายของสินค้าเดียวกัน'),
+      pickWrap, out],
     actions: [
       { label: 'ปิด', onClick: (c) => c() },
       { label: 'คำนวณ (ดูตัวอย่าง)', onClick: () => run(true) },
