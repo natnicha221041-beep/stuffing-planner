@@ -4448,7 +4448,11 @@ function packDayTotals(siteCode, date) {
 const recordsOf = (shipmentId) => store.find('packingRecords', (r) => r.shipmentId === shipmentId);
 
 // ---------------- ยกยอดถุงที่บรรจุเกิน → Shipment ถัดไป (สินค้าเดียวกัน) ----------------
-const carryIn = (id) => store.find('packTransfers', (t) => t.toId === id).reduce((a, t) => a + t.bags, 0);
+// ยกยอดคิดตามตัน: ถุงของผู้ส่ง × น้ำหนักถุงผู้ส่ง = ตัน → ฝั่งรับนับเป็นถุงของตัวเอง (ตัน ÷ น้ำหนักถุงผู้รับ)
+// เช่น 60 ถุง × 1.25 = 75 ตัน → ฝั่งรับ (1.20 ตัน/ถุง) = 62.5 ถุง = 75 ตัน — ตันทั้งสองฝั่งเท่ากันเสมอ
+const wOfId = (id) => mtPerBag(store.get('shipments', id));
+const bagsAtReceiver = (t, toId = t.toId) => { const wf = wOfId(t.fromId); const wt = wOfId(toId); return wf > 0 && wt > 0 ? t.bags * wf / wt : t.bags; };
+const carryIn = (id) => store.find('packTransfers', (t) => t.toId === id).reduce((a, t) => a + bagsAtReceiver(t, id), 0);
 const carryOut = (id) => store.find('packTransfers', (t) => t.fromId === id).reduce((a, t) => a + t.bags, 0);
 /** ถุงยกมาสุทธิ = ยกมาตั้งต้น + รับยกยอดเข้า − ยกยอดออก */
 const openingOf = (s) => Number(s.packOpening || 0) + carryIn(s.id) - carryOut(s.id);
@@ -4488,7 +4492,10 @@ function rebalanceCarry(shipmentId, depth = 0, moves = []) {
     const targets = carryTargets(s);
     for (const t of targets) {
       if (delta <= 0) break;
-      const n = Math.min(delta, t.room); // ยกไปได้ไม่เกินถุงที่ Shipment ปลายทางยังต้องใช้
+      // ยกไปได้ไม่เกินถุงที่ปลายทางยังต้องใช้ (แปลงเป็นถุงของผู้ส่งตามน้ำหนักถุง)
+      const wf = mtPerBag(s); const wt = mtPerBag(t.x);
+      const roomFrom = wf > 0 && wt > 0 ? Math.floor((t.room * wt) / wf + 1e-9) : t.room;
+      const n = Math.min(delta, roomFrom);
       if (n <= 0) continue;
       const ex = store.findOne('packTransfers', (x) => x.fromId === s.id && x.toId === t.x.id);
       if (ex) store.update('packTransfers', ex.id, { bags: ex.bags + n, date: todayISO() });
@@ -4542,7 +4549,7 @@ function reconcilePlan(shipmentId, { today = todayISO() } = {}) {
     const per = bagsPerCont(s);
     const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * per);
     const done = recordsOf(s.id).reduce((a, r) => a + (r.actualBags != null ? r.actualBags : plannable(r) ? 0 : (r.plannedBags || 0)), 0);
-    return Math.max(0, Number(s.bags) - openingOf(s) - assumed - done);
+    return Math.max(0, Math.round(Number(s.bags) - openingOf(s) - assumed - done));
   };
   const firstLoad = (s) => store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort()[0] ?? '9999';
   const firstRec = (s) => recs.filter((r) => r.shipmentId === s.id && ((r.plannedBags || 0) > 0 || r.actualBags != null)).map((r) => r.date).sort()[0] ?? null;
@@ -5120,7 +5127,7 @@ function forwardPackPlan({ siteCode = 'KK', startDate, endDate, shipmentIds = nu
     const remainingOf = (s) => {
       const assumed = Math.round(unitsOf(s.id).filter((u) => u.assumed && u.status === 'loaded').length * bagsPerCont(s));
       const done = recsOf(s.id).reduce((a, r) => a + (r.actualBags != null ? r.actualBags : replace(r) ? 0 : (r.plannedBags || 0)), 0);
-      return Math.max(0, Number(s.bags) - openingOf(s) - assumed - done);
+      return Math.max(0, Math.round(Number(s.bags) - openingOf(s) - assumed - done));
     };
     const loadsOf = (s) => store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort();
     const items = ships.map((s) => {
@@ -5233,7 +5240,7 @@ function autoPlanCandidates(siteCode = 'KK') {
     const w = mtPerBag(s);
     const recs = recordsOf(s.id);
     const future = recs.filter((x) => x.actualBags == null && x.date >= today).reduce((a, x) => a + (x.plannedBags || 0), 0);
-    const remaining = Math.max(0, Number(s.bags) - r.packedDone);
+    const remaining = Math.max(0, Math.round(Number(s.bags) - r.packedDone));
     const status = remaining <= 0 ? 'done' : future <= 0 ? 'none' : future + 0 < remaining ? 'partial' : 'full';
     const loads = store.find('shipmentPlans', (p) => p.shipmentId === s.id && p.conts > 0 && p.date >= today).map((p) => p.date).sort();
     const dates = recs.filter((x) => x.actualBags == null && x.date >= today && x.plannedBags > 0).map((x) => x.date).sort();
@@ -9901,7 +9908,10 @@ function mainTable(g, site, rerender) {
       r.carryOut ? h('div.sub', { style: { color: 'var(--primary)' } }, `−${T(r.carryOut)} ตัน ยกออก`) : null));
     tr.append(h('td.nowrap', h('div', `${T(rd.packedActual)} / ${T(rd.plannedOrPacked)}`),
       h('div.sub', rd.remainingToPlan ? `ยังไม่ลงแผน ${T(rd.remainingToPlan)} ตัน` : rd.overPlanned ? `แผนเกิน ${T(rd.overPlanned)} ตัน` : rd.packedDone >= r.bags ? 'บรรจุครบ' : 'ลงแผนครบ'),
-      r.packFirst ? h('div.sub', `แผนบรรจุ ${fmt.date(r.packFirst, { day: 'numeric', month: 'short' })}${r.packLast !== r.packFirst ? `–${fmt.date(r.packLast, { day: 'numeric', month: 'short' })}` : ''}`) : null));
+      r.packFirst ? h('div.sub', `แผนบรรจุ ${fmt.date(r.packFirst, { day: 'numeric', month: 'short' })}${r.packLast !== r.packFirst ? `–${fmt.date(r.packLast, { day: 'numeric', month: 'short' })}` : ''}`) : null,
+      // มียกมา / รับยก / ยกออก → บอกที่มาของยอด ให้เห็นว่าทำไมแผนน้อยกว่าตันทั้งหมด
+      (rd.opening || rd.assumedBags) ? h('div.sub', { style: { color: 'var(--primary)' } },
+        `${rd.opening + rd.assumedBags >= 0 ? 'ยกมา/รับยก' : 'ยกออก'} ${T(Math.abs(rd.opening + rd.assumedBags))} + แผน ${T(rd.plannedOrPacked)} = ${T(rd.covered)} / ${T(r.bags)} ตัน`) : null));
 
     g.dates.forEach((d, ci) => {
       const c = r.cells[d.date];
