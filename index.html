@@ -374,6 +374,14 @@ table.pgrid td.pc .past .sub { font-size: 10px; font-weight: 400; }
 
 .modal.wide{width:min(1180px,96vw);max-width:96vw}
 
+/* แท็บในหน้าแผนบรรจุ */
+.tab-bar{display:flex;gap:6px;margin:4px 0 10px;border-bottom:2px solid var(--line)}
+.tab-btn{border:0;background:none;padding:10px 16px;font-size:15px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px;display:flex;gap:8px;align-items:center;font-family:inherit}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary)}
+.tab-count{background:var(--surface-2,#eef2f7);color:inherit;border-radius:999px;padding:1px 9px;font-size:12px}
+.tab-btn.active .tab-count{background:var(--primary);color:#fff}
+
 </style>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='8' width='26' height='16' rx='2' fill='%231d4ed8'/><path d='M9 11v10M14 11v10M19 11v10M24 11v10' stroke='white' stroke-width='2'/></svg>" />
 </head>
@@ -4403,7 +4411,7 @@ Object.defineProperty(__exports, "packDailyRange", { enumerable: true, get: () =
 const { store } = __require("backend/db/store.js");
 const { todayISO, addDays, isISODate, dateRange } = __require("backend/utils/date.js");
 const { badRequest, notFound, ValidationBlockedError } = __require("backend/utils/errors.js");
-const { siteOf, unitsOf, bagsPerCont, round, planMt, containerTracking } = __require("backend/services/kk/core.js");
+const { siteOf, unitsOf, bagsPerCont, round, planMt, containerTracking, shipmentSummary } = __require("backend/services/kk/core.js");
 const { readWorkbook, isDateSerial, serialToISO, colToNum } = __require("backend/lib/xlsx.js");
 const { buildXlsx } = __require("backend/lib/xlsxWrite.js");
 
@@ -4912,11 +4920,30 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
   }));
   const needle = q.trim().toLowerCase();
   const rows = [];
+  const doneRows = []; // บรรจุครบแล้ว — แยกไปอีกแท็บ ไม่รวมกับแผนบรรจุ
   const alerts = [];
   for (const s of store.find('shipments', (x) => x.siteCode === site.code && needsPacking(x))) {
     const r = readiness(s, today);
     const issues = validatePackingShipment(s, today);
     const recs = recordsOf(s.id);
+    if (r.packedDone >= Number(s.bags)) {
+      if (needle && ![s.code, s.customerName, s.product, s.bookingNo].some((v) => String(v || '').toLowerCase().includes(needle))) continue;
+      const w = mtPerBag(s);
+      const act = recs.filter((x) => x.actualBags != null && x.actualBags > 0).map((x) => x.date).sort();
+      const units = unitsOf(s.id).filter((u) => !u.assumed && u.planDate);
+      const sum = shipmentSummary(s, today);
+      const loads = [...new Set(units.map((u) => u.planDate))].sort();
+      doneRows.push({
+        id: s.id, code: s.code, customerName: s.customerName, product: s.product, bags: s.bags, mt: round(s.mt || 0, 2), mtPerBag: round(w, 4),
+        line: lineOfShipment(s)?.code ?? null, lines: [...new Set(recs.filter((x) => x.actualBags != null).map((x) => x.lineCode))],
+        packedMt: round(r.packedDone * w, 2), actualMt: round(r.packedActual * w, 2), openingMt: round(r.opening * w, 2),
+        carryInMt: round(carryIn(s.id) * w, 2), carryOutMt: round(carryOut(s.id) * w, 2),
+        packFirst: act[0] ?? null, packLast: act.at(-1) ?? null,
+        firstLoad: loads[0] ?? null, lastLoad: loads.at(-1) ?? null, nextLoad: loads.find((d) => d >= today) ?? null,
+        conts: s.conts, loadedConts: sum.loaded, shipped: sum.state === 'done',
+      });
+      continue;
+    }
     const relevant = r.checks.length > 0 || recs.some((x) => x.date >= start && x.date <= end) || r.remainingToPlan > 0 && r.checks.length;
     if (r.checks.length) alerts.push(...issues);
     if (!showAll && !relevant) continue;
@@ -4953,6 +4980,7 @@ function packGrid({ siteCode = 'KK', from, days = 21, q = '', showAll = false } 
   return {
     site, today, from: start, dates: dates.map((d) => ({ date: d, past: d < today, closed: (site.closedWeekdays || []).includes(weekday(d)), totals: packDayTotals(site.code, d) })),
     lines, rows,
+    doneRows: doneRows.sort((a, b) => (a.nextLoad ?? '9999').localeCompare(b.nextLoad ?? '9999') || (b.packLast ?? '').localeCompare(a.packLast ?? '') || a.code.localeCompare(b.code)),
     alerts: alerts.sort((a, b) => (a.severity === 'error' ? 0 : 1) - (b.severity === 'error' ? 0 : 1)),
     kpis: {
       shipments: rows.length,
@@ -9670,7 +9698,7 @@ const { kkState } = __require("js/kkshared.js");
 const { riskBadge } = __require("js/views/kkdash.js");
 const { showCarry } = __require("js/views/kkpackdaily.js");
 
-const state = { from: null, days: 14, q: '', alertsOpen: false };
+const state = { from: null, days: 14, q: '', alertsOpen: false, tab: 'plan' };
 const WD = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส'];
 const READY = { short: ['ถุงไม่พอ', 'red'], ok: ['พร้อมตามแผนโหลด', 'green'], planned: ['ลงแผนบรรจุครบ', 'blue'], covered: ['บรรจุจริงครบแล้ว', 'green'], no_bags: ['ไม่มีถุง', 'gray'] };
 
@@ -9733,7 +9761,13 @@ async function render(root, { rerender, kkMeta }) {
   }
 
   root.append(lineTable(g, site, rerender));
-  root.append(mainTable(g, site, rerender));
+  // แท็บ: แผนบรรจุ (ยังบรรจุไม่ครบ) | งานบรรจุครบแล้ว
+  const done = g.doneRows || [];
+  const tabBtn = (key, label, n) => h(`button.tab-btn${state.tab === key ? '.active' : ''}`, { type: 'button', onclick: () => { state.tab = key; rerender(); } }, label, h('span.tab-count', String(n)));
+  root.append(h('div.tab-bar',
+    tabBtn('plan', 'แผนบรรจุ', g.rows.length),
+    tabBtn('done', '✓ งานบรรจุครบแล้ว', done.length)));
+  root.append(state.tab === 'done' ? doneTable(done, g, site, rerender) : mainTable(g, site, rerender));
 }
 
 function kpi(label, value, sub, level) {
@@ -9850,6 +9884,32 @@ async function openLineDay(l, date, lines, site, rerender) {
   };
   await draw();
   modal({ title: `งานบรรจุ ${l.code} · ${fmt.date(date)}`, body, actions: [{ label: 'ปิด', cls: 'primary', onClick: (c) => c() }], onClose: () => { if (dirty) rerender(); } });
+}
+
+// ---------- แท็บ "งานบรรจุครบแล้ว" ----------
+function doneTable(rows, g, site, rerender) {
+  const d = (iso) => (iso ? fmt.date(iso, { day: 'numeric', month: 'short' }) : '–');
+  const body = rows.map((r) => h('tr',
+    h('td', h('div.ship-head', h('a.ship-code', { href: '#', onclick: (e) => { e.preventDefault(); openShipmentModal(r.id, { rerender, siteCode: site.code }); } }, r.code),
+      h('span.row-acts',
+        h('button.icon-btn', { type: 'button', title: 'ดู/แก้ไขรายการบรรจุ (รายวัน)', onclick: () => openPackEdit(r.id, rerender) }, '✎'),
+        h('button.icon-btn', { type: 'button', title: 'ข้อมูล Shipment', onclick: () => openShipmentModal(r.id, { rerender, siteCode: site.code }) }, 'ⓘ'))),
+      h('div.sub', r.customerName || '')),
+    h('td', h('div', r.product || '-'), h('div.sub', r.mtPerBag ? `${Number(r.mtPerBag).toFixed(2)} ตัน/ถุง` : '')),
+    h('td', (r.lines.length ? r.lines : [r.line]).filter(Boolean).join(', ') || '–'),
+    h('td.num', h('b', fmt.mt(r.mt)), h('div.sub', `${fmt.num(r.bags)} ถุง`)),
+    h('td.num', h('b', { style: { color: 'var(--green)' } }, fmt.mt(r.packedMt)),
+      r.openingMt ? h('div.sub', `บรรจุจริง ${fmt.mt(r.actualMt)} · ยกมา/รับยก ${fmt.mt(r.openingMt)}`) : null,
+      r.carryOutMt ? h('div.sub', { style: { color: 'var(--primary)' } }, `ยกออก ${fmt.mt(r.carryOutMt)} → Shipment ถัดไป`) : null),
+    h('td', r.packFirst ? `${d(r.packFirst)}${r.packLast !== r.packFirst ? ` – ${d(r.packLast)}` : ''}` : h('span.sub', 'ยกมาทั้งหมด')),
+    h('td', r.nextLoad ? [h('b', d(r.nextLoad)), r.lastLoad !== r.nextLoad ? h('div.sub', `ถึง ${d(r.lastLoad)}`) : null] : r.lastLoad ? h('span.sub', `โหลดล่าสุด ${d(r.lastLoad)}`) : h('span.sub', 'ยังไม่มีวันโหลด')),
+    h('td', r.shipped ? badge('✓ โหลดออกครบแล้ว', 'gray') : badge(`รอโหลด ${fmt.num(r.conts - r.loadedConts)}/${fmt.num(r.conts)} ตู้`, 'blue'))));
+  return h('div.card',
+    h('div.card-head', h('h2', `งานบรรจุครบแล้ว (${rows.length} Shipment)`),
+      h('span.hint', 'Shipment ที่บรรจุครบตามจำนวนตันแล้ว (รวมยกมา/รับยก) — แยกออกจากแผนบรรจุ · ถ้าแก้ยอดจริงให้ลดลงจนไม่ครบ จะกลับไปอยู่แท็บแผนบรรจุเอง')),
+    rows.length ? h('div.grid-wrap', h('table.grid',
+      h('thead', h('tr', ['Shipment', 'สินค้า', 'สายที่บรรจุ', 'ตันทั้งหมด', 'บรรจุแล้ว (ตัน)', 'ช่วงวันที่บรรจุ', 'Loading', 'สถานะโหลด'].map((t, i) => h(i === 3 || i === 4 ? 'th.num' : 'th', t)))),
+      h('tbody', body))) : h('div.empty', 'ยังไม่มี Shipment ที่บรรจุครบ'));
 }
 
 function mainTable(g, site, rerender) {
